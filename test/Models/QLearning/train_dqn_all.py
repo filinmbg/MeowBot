@@ -25,13 +25,14 @@ class DQN(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(DQN, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 256),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(64, output_dim)
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim)
         )
-
     def forward(self, x):
         return self.net(x)
 
@@ -91,9 +92,6 @@ class DQNAgent:
 
 def train_dqn_for_pair(timeframe, target, sema):
     with sema:
-        import os
-
-        # 🔍 Вивід інформації про пристрій
         print(f"\n🚀 [{os.getpid()}] {timeframe}-{target} запускається на пристрої: {device}")
         if device.type == "cuda":
             print(f"    ➕ Використовується GPU: {torch.cuda.get_device_name(0)}")
@@ -106,19 +104,44 @@ def train_dqn_for_pair(timeframe, target, sema):
             filename = f'{DATA_DIR}/BTCUSDT_{timeframe}_critical_indicators_with_targets_{target.split("_")[1]}.csv'
             df = pd.read_csv(filename)
 
-            features = df.drop(columns=[target]).values
+            if "trend_type" in df.columns:
+                df["trend_type"] = df["trend_type"].map({
+                    "uptrend": 1, "downtrend": -1, "flat": 0, "undefined": 0
+                })
+
+            cols_to_drop = [col for col in ["target_long", "target_short"] if col in df.columns]
+            features = df.drop(columns=cols_to_drop).values
             scaler = MinMaxScaler()
             features = scaler.fit_transform(features)
 
-            prices = df['close'].values
+            prices = df["close"].values
             labels = df[target].values
 
             state_dim = features.shape[1]
+            print(f"📐 Вхідних фічей: {state_dim}")
             agent = DQNAgent(state_dim, action_dim=3)
 
+            model_path = f'{SAVE_DIR}/dqn_{timeframe}_{target}.pt'
+            log_path = f'{LOG_DIR}/dqn_stats_{timeframe}_{target}.csv'
+
+            start_episode = 0
             log_data = []
 
-            for episode in range(100):
+            if os.path.exists(model_path):
+                agent.model = torch.load(model_path, weights_only=False)
+                agent.target.load_state_dict(agent.model.state_dict())
+                print(f"📦 Модель завантажена: {model_path}")
+
+            if os.path.exists(log_path):
+                log_df = pd.read_csv(log_path)
+                if not log_df.empty:
+                    last_row = log_df.iloc[-1]
+                    agent.epsilon = last_row["epsilon"]
+                    start_episode = int(last_row["episode"]) + 1
+                    log_data = log_df.values.tolist()
+                    print(f"🔁 Продовження з епізоду {start_episode}, epsilon={agent.epsilon:.3f}")
+
+            for episode in range(start_episode, 100):
                 total_reward = 0
                 for i in range(len(features) - 1):
                     state = features[i]
@@ -143,13 +166,11 @@ def train_dqn_for_pair(timeframe, target, sema):
                 log_data.append([episode, total_reward, agent.epsilon])
                 print(f"  🎯 {timeframe}-{target} | Епізод {episode:3d} | Reward: {total_reward:.2f} | Epsilon: {agent.epsilon:.3f}")
 
-            model_path = f'{SAVE_DIR}/dqn_{timeframe}_{target}.pt'
-            torch.save(agent.model, model_path)
-            print(f"✅ Модель збережена: {model_path}")
+                torch.save(agent.model, model_path)
+                log_df = pd.DataFrame(log_data, columns=['episode', 'total_reward', 'epsilon'])
+                log_df.to_csv(log_path, index=False)
 
-            log_df = pd.DataFrame(log_data, columns=['episode', 'total_reward', 'epsilon'])
-            log_path = f'{LOG_DIR}/dqn_stats_{timeframe}_{target}.csv'
-            log_df.to_csv(log_path, index=False)
+            print(f"✅ Модель збережена: {model_path}")
             print(f"🧾 Метрики збережені: {log_path}")
 
         except Exception as e:
@@ -166,7 +187,7 @@ if __name__ == '__main__':
     except RuntimeError:
         pass
 
-    sema = Semaphore(5)  # максимум 3 одночасно
+    sema = Semaphore(10)
     processes = []
 
     for tf in TIMEFRAMES:

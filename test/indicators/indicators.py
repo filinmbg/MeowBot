@@ -3,6 +3,8 @@ import pandas_ta as ta
 import os
 import glob
 import warnings
+import numpy as np
+from scipy.signal import argrelextrema
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
@@ -101,10 +103,73 @@ def add_critical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except:
         pass
 
+    # === Trend Lines (Up & Down) ===
+    def extract_trend_line(series, order=10, max_deviation=0.01, max_distance=50):
+        idx = argrelextrema(series.values, np.less_equal if series.name == "low" else np.greater_equal, order=order)[0]
+        if len(idx) < 2:
+            return 0, 0.0, 0, 0.0, 0.0, 0, 0
+        x = idx[-2:]
+        y = series.iloc[x].values
+        slope, intercept = np.polyfit(x, y, 1)
+        if x[1] - x[0] > max_distance:
+            return 0, 0.0, 0, 0.0, 0.0, 0, 0
+        confirmed = 0
+        for i in idx[:-2]:
+            pred = slope * i + intercept
+            actual = series.iloc[i]
+            deviation = abs(actual - pred) / (abs(pred) + 1e-8)
+            if deviation <= max_deviation:
+                confirmed = 1
+                break
+        i = len(series) - 1
+        price_now = series.iloc[i]
+        trend_now = slope * i + intercept
+        distance = price_now - trend_now
+        angle_deg = np.degrees(np.arctan(slope))
+        prev_price = series.iloc[i - 1] if i >= 1 else price_now
+        prev_trend = slope * (i - 1) + intercept if i >= 1 else trend_now
+        break_above = int(price_now > trend_now and prev_price <= prev_trend)
+        break_below = int(price_now < trend_now and prev_price >= prev_trend)
+        return 1, slope, confirmed, angle_deg, distance, break_above, break_below
+
+    try:
+        up_valid, up_slope, up_conf, up_angle, up_dist, up_break_above, up_break_below = extract_trend_line(df["low"])
+        down_valid, down_slope, down_conf, down_angle, down_dist, down_break_above, down_break_below = extract_trend_line(df["high"])
+
+        df["trend_up_valid"] = up_valid
+        df["trend_up_slope"] = up_slope
+        df["trend_up_confirmed"] = up_conf
+        df["trend_up_angle_deg"] = up_angle
+        df["trend_up_distance"] = up_dist
+        df["trend_up_break_above"] = up_break_above
+        df["trend_up_break_below"] = up_break_below
+
+        df["trend_down_valid"] = down_valid
+        df["trend_down_slope"] = down_slope
+        df["trend_down_confirmed"] = down_conf
+        df["trend_down_angle_deg"] = down_angle
+        df["trend_down_distance"] = down_dist
+        df["trend_down_break_above"] = down_break_above
+        df["trend_down_break_below"] = down_break_below
+
+        def classify_trend(row, threshold=0.001):
+            if row["trend_up_valid"] and row["trend_up_slope"] > threshold:
+                return "uptrend"
+            elif row["trend_down_valid"] and row["trend_down_slope"] < -threshold:
+                return "downtrend"
+            elif row["trend_up_valid"] and row["trend_down_valid"] and \
+                 abs(row["trend_up_slope"]) <= threshold and abs(row["trend_down_slope"]) <= threshold:
+                return "flat"
+            else:
+                return "undefined"
+
+        df["trend_type"] = df.apply(classify_trend, axis=1)
+
+    except Exception as e:
+        print(f"[!] trend line detection failed: {e}")
+
     df = df.fillna(method="ffill").fillna(method="bfill")
     return df
-
-
 
 
 if __name__ == "__main__":

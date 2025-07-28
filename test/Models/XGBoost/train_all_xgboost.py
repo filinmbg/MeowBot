@@ -5,13 +5,11 @@ from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 
-# Таймфрейми
-TIMEFRAMES = ['15m', '30m', '1h', '4h', '1d']
+TIMEFRAMES = ['1d', '4h', '1h', '30m', '15m']
+TARGETS = ['long', 'short']
 DATA_DIR = 'test/data/BTCUSDT'
 MODEL_DIR = 'Models/XGBoost'
-TARGET_COLUMN = 'target_long'
 
-# Заборонені до використання фічі
 DROP_COLUMNS = [
     'open_time', 'close_time', 'symbol',
     'open', 'high', 'low', 'close', 'volume',
@@ -22,22 +20,22 @@ DROP_COLUMNS = [
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+def train_model(timeframe: str, target: str):
+    target_col = f'target_{target}'
+    filename = f'BTCUSDT_{timeframe}_critical_indicators_with_targets_{target}.csv'
+    filepath = os.path.join(DATA_DIR, filename)
 
-def train_and_save_model(timeframe: str):
-    input_path = os.path.join(DATA_DIR, f'BTCUSDT_{timeframe}_with_targets.csv')
-
-    if not os.path.exists(input_path):
-        print(f"⚠️ Пропущено {timeframe} — файл не знайдено: {input_path}")
+    if not os.path.exists(filepath):
+        print(f"⚠️ Пропущено {timeframe}-{target} → немає файлу {filepath}")
         return
 
-    df = pd.read_csv(input_path)
-
-    features = [col for col in df.columns if col not in DROP_COLUMNS and df[col].dtype != 'object']
+    df = pd.read_csv(filepath)
+    features = [col for col in df.columns if col not in DROP_COLUMNS and df[col].dtype in [float, int]]
     X = df[features].dropna()
-    y = df.loc[X.index, TARGET_COLUMN]
+    y = df.loc[X.index, target_col]
 
     if y.nunique() < 2:
-        print(f"⚠ Недостатньо класів для навчання ({timeframe})")
+        print(f"⚠️ Недостатньо класів для {timeframe}-{target}")
         return
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
@@ -54,20 +52,23 @@ def train_and_save_model(timeframe: str):
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
 
-    print(f"\n🧠 [{timeframe}] Звіт точності:")
+    print(f"\n📊 Звіт {timeframe}-{target}:")
     print(classification_report(y_test, y_pred, digits=4))
 
-    model_path = os.path.join(MODEL_DIR, f'xgb_{timeframe}.joblib')
+    # Зберігаємо модель
+    model_path = os.path.join(MODEL_DIR, f'xgb_{timeframe}_{target}.joblib')
     joblib.dump(model, model_path)
 
-    features_path = os.path.join(MODEL_DIR, f'xgb_{timeframe}_features.txt')
+    # Зберігаємо фічі
+    features_path = os.path.join(MODEL_DIR, f'xgb_{timeframe}_{target}_features.txt')
     with open(features_path, 'w') as f:
         f.write('\n'.join(features))
 
-    print(f"✅ Модель збережено → {model_path}")
-    print(f"📄 Фічі збережено → {features_path}")
+    print(f"✅ Модель збережено: {model_path}")
+    print(f"📄 Фічі збережено: {features_path}")
 
 
 if __name__ == '__main__':
     for tf in TIMEFRAMES:
-        train_and_save_model(tf)
+        for target in TARGETS:
+            train_model(tf, target)
