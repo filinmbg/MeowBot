@@ -1,119 +1,209 @@
-import pandas as pd
-import numpy as np
 import os
 import gym
-from gym import spaces
-from stable_baselines3 import PPO
+import torch
+import warnings
+import numpy as np
+import pandas as pd
 from tqdm import tqdm
+from sklearn.metrics import classification_report
+from sklearn.preprocessing import StandardScaler
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from concurrent.futures import ProcessPoolExecutor
+from configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
+from gym import spaces
 
-# 🔧 Параметри
-timeframes = ["1d", "4h", "1h", "30m", "15m"]
-targets = ["long", "short"]
-data_dir = "test/data/BTCUSDT"
-save_dir = "Models/PPO"
-os.makedirs(save_dir, exist_ok=True)
+# Suppress warnings and logs
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+warnings.filterwarnings("ignore", category=UserWarning)
 
-results = []  # Для фінальної статистики
+# Paths
+DATA_DIR = "test/data/BTCUSDT"
+MODEL_DIR = "Models/PPO"
+LOG_DIR = "Models/PPO/logs"
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
+TOTAL_TIMESTEPS = 10_000
+MAX_WORKERS = 10
 
-class PPOTradingEnv(gym.Env):
-    def __init__(self, X, y, initial_balance=100.0, leverage=20):
+class TradingEnv(gym.Env):
+    metadata = {"render.modes": ["human"]}
+
+    def __init__(self, df, features, window_size=30):
         super().__init__()
-        self.X = X.reset_index(drop=True).astype(np.float32)
-        self.y = y.reset_index(drop=True).astype(int)
-        self.initial_balance = initial_balance
-        self.leverage = leverage
-        self.action_space = spaces.Discrete(2)  # 0 = HOLD, 1 = OPEN
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.X.shape[1],), dtype=np.float32)
-
-    def reset(self):
+        self.df = df.reset_index(drop=True)
+        self.features = features
+        self.window_size = window_size
         self.current_step = 0
-        self.balance = self.initial_balance
-        return self._get_obs()
+        self.total_steps = len(df) - 1
 
-    def _get_obs(self):
-        return self.X.iloc[self.current_step].values
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(window_size, len(features)),
+            dtype=np.float32
+        )
+
+        self.action_space = spaces.Discrete(3)  # 0 = hold, 1 = long, 2 = short
+        self.position = 0
+        self.entry_price = 0
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_step = self.window_size
+        self.position = 0
+        self.entry_price = 0
+        return self._get_observation(), {}
 
     def step(self, action):
-        done = False
         reward = 0
-        price = self.X.iloc[self.current_step]["close"]
-        signal = self.y.iloc[self.current_step]
+        done = False
+        current_price = self.df.iloc[self.current_step]["close"]
 
-        if action == 1:  # Відкрити трейд
-            if signal == 1:
-                reward = +self.leverage * self.balance * 0.01 * 0.01  # +1% прибутку
-            else:
-                reward = -self.leverage * self.balance * 0.01 * 0.01  # -1% збитку
-            self.balance += reward
+        if self.position == 0:
+            if action == 1:
+                self.position = 1
+                self.entry_price = current_price
+            elif action == 2:
+                self.position = 2
+                self.entry_price = current_price
+        else:
+            if action == 0:
+                pass
+            elif (self.position == 1 and action == 2) or (self.position == 2 and action == 1):
+                reward = self._get_profit(current_price)
+                self.position = action
+                self.entry_price = current_price
 
         self.current_step += 1
-        if self.current_step >= len(self.X) - 1:
+        if self.current_step >= self.total_steps:
             done = True
-        obs = self._get_obs() if not done else np.zeros_like(self.X.iloc[0].values)
+            reward += self._get_profit(current_price)
 
-        return obs, reward, done, {}
+        return self._get_observation(), reward, done, {}
 
-    def render(self, mode='human'):
-        print(f"Step: {self.current_step}, Balance: {self.balance:.2f}")
+    def _get_profit(self, current_price):
+        if self.position == 1:
+            return current_price - self.entry_price
+        elif self.position == 2:
+            return self.entry_price - current_price
+        return 0
 
-    def get_final_balance(self):
-        return self.balance
+    def _get_observation(self):
+        window = self.df.iloc[self.current_step - self.window_size:self.current_step][self.features]
+        return window.values.astype(np.float32)
 
+def train_single_model(args):
+    timeframe, target, variant, features = args
+    model_name = f"PPO_{timeframe}_{target}_V{variant}"
+    model_path = os.path.join(MODEL_DIR, model_name, "model.zip")
+    log_path = os.path.join(MODEL_DIR, model_name, "log.txt")
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
 
-for tf in timeframes:
-    for target in targets:
-        print(f"\n📊 Тренування PPO для: {tf} / target_{target}")
+    print(f"[{model_name}] 🚀 Training started")
 
-        csv_path = os.path.join(data_dir, f"BTCUSDT_{tf}_critical_indicators_with_targets_{target}.csv")
-        if not os.path.exists(csv_path):
-            print(f"❌ Не знайдено: {csv_path}")
-            continue
+    if os.path.exists(model_path):
+        return f"[{model_name}] ✅ Already trained"
 
-        df = pd.read_csv(csv_path).dropna()
-        if f"target_{target}" not in df.columns:
-            print(f"⚠️ Немає колонки target_{target} у {csv_path}")
-            continue
+    try:
+        file_path = os.path.join(DATA_DIR, f"BTCUSDT_{timeframe}_critical_indicators_with_targets_{target}.csv")
+        if not os.path.exists(file_path):
+            return f"[{model_name}] ❌ Missing file: {file_path}"
 
-        y = df[f"target_{target}"]
-        X = df.drop(columns=[col for col in df.columns if col.startswith("target")])
+        df = pd.read_csv(file_path).dropna()
+        if "close" not in df.columns:
+            return f"[{model_name}] ❌ Missing 'close' column"
 
-        # Зберегти список фіч
-        feature_list = list(X.columns)
-        features_path = os.path.join(save_dir, f"features_{tf}_target_{target}.txt")
-        with open(features_path, "w") as f:
-            for feat in feature_list:
-                f.write(feat + "\n")
+        target_col = f"target_{target}" if f"target_{target}" in df.columns else "target"
+        if target_col not in df.columns:
+            return f"[{model_name}] ❌ Missing target column"
 
-        # PPO середовище
-        env = PPOTradingEnv(X, y)
-        model = PPO("MlpPolicy", env, verbose=0, tensorboard_log=f"./ppo_logs/{tf}_{target}")
-        model.learn(total_timesteps=100_000)
+        missing = [f for f in features if f not in df.columns]
+        if missing:
+            return f"[{model_name}] ❌ Missing features: {missing}"
 
-        # Збереження моделі
-        model_path = os.path.join(save_dir, f"ppo_{tf}_{target}")
+        y = df[target_col].values.astype(int)
+        if np.all(y == 0):
+            return f"[{model_name}] ⚠️ Only HOLD samples"
+
+        scaler = StandardScaler()
+        df[features] = scaler.fit_transform(df[features])
+
+        def make_env():
+            return TradingEnv(df, features)
+
+        env = DummyVecEnv([make_env])
+        model = PPO("MlpPolicy", env, verbose=0, device="cuda" if torch.cuda.is_available() else "cpu")
+        model.learn(total_timesteps=TOTAL_TIMESTEPS)
         model.save(model_path)
 
-        # Підсумкова метрика
-        balance = env.get_final_balance()
-        target_pct = round(100 * y.sum() / len(y), 2)
+        obs, _ = env.reset()
+        predictions, truths = [], []
 
-        results.append({
-            "timeframe": tf,
-            "target": target,
-            "samples": len(y),
-            "target_1_pct": target_pct,
-            "final_balance": round(balance, 2),
-            "model": model_path
-        })
+        for i in range(len(df) - 30):
+            action, _ = model.predict(obs, deterministic=True)
 
-        print(f"✅ Модель збережена: {model_path}")
-        print(f"ℹ️ Кількість зразків: {len(y)}, target=1: {target_pct}%, Баланс: ${round(balance, 2)}")
+            # Ensure action is scalar
+            if isinstance(action, np.ndarray):
+                action_val = int(action[0])
+            else:
+                action_val = int(action)
 
-# 📊 Фінальна статистика
-print("\n📈 Підсумкова статистика моделей:")
-df_results = pd.DataFrame(results)
-print(df_results.to_string(index=False))
+            predictions.append(action_val)
+            truths.append(y[i + 30])
 
-# Зберегти CSV
-df_results.to_csv(os.path.join(save_dir, "ppo_training_results.csv"), index=False)
+            try:
+                obs, reward, done, info = env.step([action_val])  # wrap in list for DummyVecEnv
+                if isinstance(done, np.ndarray):
+                    if done[0]:
+                        break
+                elif done:
+                    break
+            except Exception as e:
+                print(f"[{model_name}] ❌ step() error at i={i}: {str(e)}")
+                return f"[{model_name}] ❌ error: {str(e)}"
+
+        report = classification_report(truths, predictions, zero_division=0, output_dict=True)
+        acc = report["accuracy"]
+        f1 = report["1"]["f1-score"]
+        prec = report["1"]["precision"]
+        recall = report["1"]["recall"]
+        winrate = np.mean(np.array(predictions) == np.array(truths))
+
+        summary = (
+            f"[{model_name}] ✅ Trained\n"
+            f"  - Accuracy: {acc:.4f}\n"
+            f"  - Precision: {prec:.4f}\n"
+            f"  - Recall: {recall:.4f}\n"
+            f"  - F1-score: {f1:.4f}\n"
+            f"  - Winrate: {winrate:.4f}"
+        )
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(summary + "\n\n")
+            f.write(classification_report(truths, predictions, zero_division=0))
+
+        return summary
+
+    except Exception as e:
+        print(f"[{model_name}] ❌ Top-level error: {str(e)}")
+        return f"[{model_name}] ❌ error: {str(e)}"
+
+def main():
+    print(f"🧠 Starting PPO training on {len(TIMEFRAMES) * len(TARGETS) * len(VARIANT_FEATURE_SETS)} models with {MAX_WORKERS} workers...\n")
+    tasks = [
+        (timeframe, target, variant, features)
+        for timeframe in TIMEFRAMES
+        for target in TARGETS
+        for variant, features in VARIANT_FEATURE_SETS.items()
+    ]
+
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        results = list(tqdm(executor.map(train_single_model, tasks), total=len(tasks)))
+
+    for r in results:
+        print(r)
+
+if __name__ == "__main__":
+    main()

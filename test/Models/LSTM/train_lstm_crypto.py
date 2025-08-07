@@ -1,134 +1,163 @@
 import os
+import torch
+import torch.nn as nn
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from imblearn.over_sampling import RandomOverSampler
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 
-# 🔧 Конфігурація
-TIMEFRAMES = ['1d', '4h', '1h', '30m', '15m']
-TARGETS = ['target_long', 'target_short']
-SEQ_LEN = 20
-BATCH_SIZE = 32
-EPOCHS = 50
-HIDDEN_SIZE = 64
-N_LAYERS = 2
-LEARNING_RATE = 0.001
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+from copy import deepcopy
+
+
+
+from configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_DIR = 'test/data/BTCUSDT'
-MODEL_DIR = 'Models/LSTM'
+MODEL_DIR = 'Models/LSTM/saved_models'
+RESULT_CSV = 'Models/LSTM/lstm_training_results.csv'
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-
-# 🧠 Модель LSTM
-class LSTMClassifier(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim=2, num_layers=2):
+# ----- MODEL -----
+class CNNLSTMModel(nn.Module):
+    def __init__(self, input_size):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.lstm = nn.LSTM(input_size=16, hidden_size=32, batch_first=True)
+        self.fc = nn.Linear(32, 1)
 
     def forward(self, x):
+        x = x.unsqueeze(1)
+        x = self.relu(self.conv1(x))
+        x = x.permute(0, 2, 1)
         _, (hn, _) = self.lstm(x)
         out = self.fc(hn[-1])
-        return out
+        return out.squeeze()
 
+# ----- TRAIN FUNCTION -----
+def train_model(model, train_loader, criterion, optimizer):
+    model.train()
+    for x_batch, y_batch in train_loader:
+        x_batch = x_batch.float().to(DEVICE)
+        y_batch = y_batch.float().to(DEVICE)
+        optimizer.zero_grad()
+        output = model(x_batch)
+        loss = criterion(output, y_batch)
+        loss.backward()
+        optimizer.step()
 
-# 🎞️ Створення послідовностей
-def create_sequences(X, y, seq_len):
-    X_seq, y_seq = [], []
-    for i in range(len(X) - seq_len):
-        X_seq.append(X[i:i + seq_len])
-        y_seq.append(y[i + seq_len])
-    return np.array(X_seq), np.array(y_seq)
-
-
-# 🚀 Навчання для однієї моделі
-def train_model_for(tf, target):
-    print(f"\n📈 Навчання {tf} - {target}")
-
-    suffix = target.split('_')[1]
-    filename = f"BTCUSDT_{tf}_critical_indicators_with_targets_{suffix}.csv"
-    path = os.path.join(DATA_DIR, filename)
-
-    if not os.path.exists(path):
-        print(f"⚠️ Пропущено — файл не знайдено: {filename}")
-        return
-
-    df = pd.read_csv(path).dropna()
-    drop_cols = ["open_time", "close_time", "open", "close", "target_long", "target_short"]
-    drop_cols.remove(target)
-    drop_cols += [target]
-
-    X = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
-    y = df[target]
-
-    # 💾 Збереження фіч
-    feature_path = os.path.join(MODEL_DIR, f"features_{tf}_{target}.txt")
-    with open(feature_path, "w") as f:
-        f.write("\n".join(X.columns))
-    print(f"📊 Кількість фіч: {X.shape[1]}")
-
-    # Масштабування
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    X_seq, y_seq = create_sequences(X_scaled, y.values, SEQ_LEN)
-
-    # Балансування
-    ros = RandomOverSampler()
-    X_flat, y_bal = ros.fit_resample(X_seq.reshape(X_seq.shape[0], -1), y_seq)
-    X_seq_bal = X_flat.reshape(-1, SEQ_LEN, X.shape[1])
-
-    # Розділення
-    X_train, X_val, y_train, y_val = train_test_split(X_seq_bal, y_bal, test_size=0.2, stratify=y_bal, random_state=42)
-
-    train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long))
-    val_ds = TensorDataset(torch.tensor(X_val, dtype=torch.float32), torch.tensor(y_val, dtype=torch.long))
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
-
-    # Модель
-    model = LSTMClassifier(input_dim=X.shape[1], hidden_dim=HIDDEN_SIZE, num_layers=N_LAYERS)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    loss_fn = nn.CrossEntropyLoss()
-
-    # Тренування
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0
-        for xb, yb in train_loader:
-            optimizer.zero_grad()
-            preds = model(xb)
-            loss = loss_fn(preds, yb)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        print(f"🧪 Epoch {epoch + 1}/{EPOCHS} - Loss: {total_loss / len(train_loader):.4f}")
-
-    # Оцінка
+# ----- EVALUATE FUNCTION -----
+def evaluate_model(model, X_test, y_test):
     model.eval()
-    correct, total = 0, 0
     with torch.no_grad():
-        for xb, yb in val_loader:
-            preds = model(xb)
-            predicted = preds.argmax(dim=1)
-            correct += (predicted == yb).sum().item()
-            total += yb.size(0)
+        X_tensor = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
+        preds = torch.sigmoid(model(X_tensor))
+        y_pred = (preds.cpu().numpy() > 0.5).astype(int)
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
 
-    acc = correct / total
-    print(f"✅ Validation Accuracy: {acc:.4f}")
+        # 🔍 Додаткове логування
+        cm = confusion_matrix(y_test, y_pred)
+        if cm.shape == (2, 2):
+            tn, fp, fn, tp = cm.ravel()
+            print(f"    Confusion matrix: TN={tn}, FP={fp}, FN={fn}, TP={tp}")
+        else:
+            print(f"    Confusion matrix: {cm.tolist()}")
 
-    # Збереження моделі
-    model_path = os.path.join(MODEL_DIR, f"lstm_{tf}_{target}.pt")
-    torch.save(model.state_dict(), model_path)
-    print(f"💾 Збережено: {model_path}")
+        return acc, prec, rec, f1
 
+# ----- MAIN LOOP -----
+results = []
 
-# 🔁 Запуск всіх моделей
-for tf in TIMEFRAMES:
+for timeframe in tqdm(TIMEFRAMES, desc="Timeframes"):
     for target in TARGETS:
-        try:
-            train_model_for(tf, target)
-        except Exception as e:
-            print(f"❌ Помилка {tf} {target}: {e}")
+        file_path = os.path.join(DATA_DIR, f'BTCUSDT_{timeframe}_critical_indicators_with_targets_{target}.csv')
+        if not os.path.exists(file_path):
+            print(f"❌ Файл не знайдено: {file_path}")
+            continue
+
+        df = pd.read_csv(file_path).dropna()
+
+        for variant_name, features in tqdm(VARIANT_FEATURE_SETS.items(), desc=f"{timeframe}-{target}", leave=False):
+            missing = [f for f in features if f not in df.columns]
+            target_col = f"target_{target}"
+            if target_col not in df.columns:
+                missing.append(target_col)
+            if missing:
+                print(f"⛔ Пропущено {timeframe}-{target}-{variant_name} через відсутні фічі: {missing}")
+                continue
+
+            X = df[features].values
+            y = df[target_col].values
+
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+            X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(DEVICE)
+            y_train_tensor = torch.tensor(y_train, dtype=torch.float32).to(DEVICE)
+
+            # === POS WEIGHT ===
+            pos_count = np.sum(y_train == 1)
+            neg_count = np.sum(y_train == 0)
+            if pos_count == 0:
+                print(f"⛔ Пропущено {timeframe}-{target}-{variant_name} бо немає позитивних прикладів.")
+                continue
+            pos_weight_value = neg_count / (pos_count + 1e-5)
+            pos_weight = torch.tensor([pos_weight_value]).to(DEVICE)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+            train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+            train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+            model = CNNLSTMModel(input_size=len(features)).to(DEVICE)
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+            best_f1 = 0
+            best_state = None
+            patience_counter = 0
+            f1_scores = []
+
+            for epoch in range(100):
+                train_model(model, train_loader, criterion, optimizer)
+                acc, prec, rec, f1 = evaluate_model(model, X_test, y_test)
+                f1_scores.append(f1)
+
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_state = deepcopy(model.state_dict())
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                print(f"🧠 Epoch {epoch+1:03d} | F1: {f1:.4f} | Best: {best_f1:.4f} | Patience: {patience_counter}/20")
+
+                if patience_counter >= 20:
+                    print(f"⏹️ Рання зупинка на епосі {epoch+1}")
+                    break
+
+            if best_state:
+                model.load_state_dict(best_state)
+
+            acc, prec, rec, f1 = evaluate_model(model, X_test, y_test)
+
+            model_name = f'LSTM_{timeframe}_{target}_{variant_name}.pt'
+            model_path = os.path.join(MODEL_DIR, model_name)
+            torch.save(model.state_dict(), model_path)
+
+            results.append({
+                'timeframe': timeframe,
+                'target': target,
+                'variant': variant_name,
+                'accuracy': acc,
+                'precision': prec,
+                'recall': rec,
+                'f1_score': f1,
+                'model_path': model_path
+            })
+
+# Save results
+pd.DataFrame(results).to_csv(RESULT_CSV, index=False)
+print(f"\n✅ Результати збережено в {RESULT_CSV}")

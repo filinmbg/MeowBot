@@ -1,147 +1,144 @@
 import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
+import warnings
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import f1_score
-import tensorflow as tf
-from tensorflow.keras import layers, models
+from sklearn.metrics import accuracy_score, f1_score
+from configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
 
-# 🔧 Конфігурація
-TIMEFRAMES = ['1d', '4h', '1h', '30m', '15m']
-TARGETS = ['target_long', 'target_short']
-DATA_DIR = 'test/data/BTCUSDT'
-MODEL_DIR = 'Models/CNN'
-BATCH_SIZE = 64
-EPOCHS = 50
-VALIDATION_SPLIT = 0.2
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-# 🔁 F1-колбек
-class F1Callback(tf.keras.callbacks.Callback):
-    def __init__(self, X_val, y_val):
-        super().__init__()
-        self.X_val = X_val
-        self.y_val = y_val
+class SimpleCNN(nn.Module):
+    def __init__(self, input_size):
+        super(SimpleCNN, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=16, kernel_size=3, padding=1)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc1 = nn.Linear(16, 1)
+        self.sigmoid = nn.Sigmoid()
 
-    def on_epoch_end(self, epoch, logs=None):
-        y_pred = (self.model.predict(self.X_val) > 0.5).astype(int)
-        f1 = f1_score(self.y_val, y_pred)
-        print(f"🔍 val_f1: {f1:.4f}")
-
-# 📥 Завантаження CSV
-def load_data(timeframe, target):
-    suffix = target.split('_')[1]
-    filename = f"BTCUSDT_{timeframe}_critical_indicators_with_targets_{suffix}.csv"
-    filepath = os.path.join(DATA_DIR, filename)
-    df = pd.read_csv(filepath)
-    df.dropna(inplace=True)
-    return df
-
-# 🔃 Обробка X та y
-def prepare_data(df, target, timeframe=None):
-    # Колонки, які точно не є фічами
-    drop_cols = ["open_time", "close_time", "open", "close", "target_long", "target_short"]
-    drop_cols.remove(target)  # залишаємо тільки потрібний таргет
-
-    # Формування X та y
-    drop_cols += [target]
-    X = df.drop(columns=[col for col in drop_cols if col in df.columns], errors="ignore")
-
-    y = df[target]
-
-    # 💾 Збереження списку фіч
-    features_path = os.path.join(MODEL_DIR, f"features_{timeframe}_{target}.txt")
-    with open(features_path, "w") as f:
-        f.write("\n".join(X.columns))
-
-    print(f"📊 Фічі для моделі ({target}): {X.shape[1]}")
-    print(f"📋 Список: {list(X.columns)}")
-
-    # Масштабування
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    X_scaled = X_scaled.reshape((X_scaled.shape[0], 1, X_scaled.shape[1]))
-
-    return train_test_split(X_scaled, y, test_size=VALIDATION_SPLIT, shuffle=False)
+    def forward(self, x):
+        # x: (batch, 1, num_features)
+        x = torch.relu(self.conv1(x))  # (batch, 16, num_features)
+        x = self.pool(x)               # (batch, 16, 1)
+        x = x.view(x.size(0), -1)      # (batch, 16)
+        x = self.fc1(x)                # (batch, 1)
+        return self.sigmoid(x)
 
 
-# 🧠 CNN-модель
-def build_model(input_shape):
-    model = models.Sequential([
-        tf.keras.Input(shape=input_shape),  # ✅ Явно задаємо форму
-        layers.Conv1D(64, kernel_size=1, activation='relu'),
-        layers.Dropout(0.3),
-        layers.Conv1D(32, kernel_size=1, activation='relu'),
-        layers.Flatten(),
-        layers.Dense(64, activation='relu'),
-        layers.Dense(1, activation='sigmoid')
-    ])
-    model.compile(
-        optimizer='adam',
-        loss='binary_crossentropy',
-        metrics=[
-            'accuracy',
-            tf.keras.metrics.Precision(name='precision'),
-            tf.keras.metrics.Recall(name='recall')
-        ]
-    )
-    return model
+def train_model(timeframe, target, variant_id, features):
+    model_name = f"CNN_{timeframe}_{target}_V{variant_id}"
+    save_path = f"Models/CNN/{model_name}.pt"
+    csv_path = f"test/data/BTCUSDT/BTCUSDT_{timeframe}_critical_indicators_with_targets_{target}.csv"
 
-# 🚀 Тренування + збереження
-def train_and_save(timeframe, target, stats):
-    print(f"\n📈 Тренування для: {timeframe.upper()} - {target}")
-    df = load_data(timeframe, target)
-    X_train, X_val, y_train, y_val = prepare_data(df, target)
+    if os.path.exists(save_path):
+        return model_name, None, None, "⏭️ already exists"
 
-    model = build_model(input_shape=(X_train.shape[1], X_train.shape[2]))
+    if not os.path.exists(csv_path):
+        return model_name, None, None, "❌ file missing"
 
-    f1_history = []
+    try:
+        df = pd.read_csv(csv_path)
 
-    class FinalF1(tf.keras.callbacks.Callback):
-        def on_epoch_end(self, epoch, logs=None):
-            y_pred = (self.model.predict(X_val) > 0.5).astype(int)
-            f1 = f1_score(y_val, y_pred)
-            f1_history.append(f1)
-            print(f"🔍 val_f1: {f1:.4f}")
+        # перевірка наявності всіх фіч
+        missing = [f for f in features if f not in df.columns]
+        if missing:
+            return model_name, None, None, f"❌ missing features: {missing}"
 
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        callbacks=[FinalF1()],
-        verbose=2
-    )
+        target_column = f"target_{target}" if f"target_{target}" in df.columns else "target"
+        if target_column not in df.columns:
+            return model_name, None, None, f"❌ missing target column: {target_column}"
 
-    # Зберігаємо модель
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    model_path = os.path.join(MODEL_DIR, f"cnn_{timeframe}_{target}.keras")
-    model.save(model_path)
-    print(f"✅ Збережено модель: {model_path}")
+        X = df[features].values
+        y = df[target_column].values
 
-    # Додаємо фінальні метрики до статистики
-    stats.append({
-        "timeframe": timeframe,
-        "target": target,
-        "val_accuracy": round(history.history["val_accuracy"][-1], 4),
-        "precision": round(history.history["val_precision"][-1], 4),
-        "recall": round(history.history["val_recall"][-1], 4),
-        "f1": round(f1_history[-1], 4)
-    })
+        # NaN check
+        if np.isnan(X).any() or np.isnan(y).any():
+            return model_name, None, None, "❌ NaN in data"
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        X_scaled = X_scaled.reshape((X_scaled.shape[0], 1, X_scaled.shape[1]))  # (samples, 1, features)
+
+        X_train, X_val, y_train, y_val = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+
+        X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+        X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+        y_val_tensor = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1)
+
+        model = SimpleCNN(input_size=X_train_tensor.shape[2])
+        criterion = nn.BCELoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+        best_loss = float('inf')
+        patience, counter = 10, 0
+
+        for epoch in range(100):
+            model.train()
+            optimizer.zero_grad()
+            outputs = model(X_train_tensor)
+            loss = criterion(outputs, y_train_tensor)
+            if torch.isnan(loss) or torch.isinf(loss):
+                return model_name, None, None, "❌ loss is NaN or Inf"
+            loss.backward()
+            optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                val_outputs = model(X_val_tensor)
+                val_loss = criterion(val_outputs, y_val_tensor).item()
+
+            if val_loss < best_loss:
+                best_loss = val_loss
+                torch.save(model.state_dict(), save_path)
+                counter = 0
+            else:
+                counter += 1
+                if counter >= patience:
+                    break  # early stopping
+
+        model.load_state_dict(torch.load(save_path))
+        model.eval()
+        with torch.no_grad():
+            preds = model(X_val_tensor)
+            predicted = (preds > 0.5).float()
+            acc = accuracy_score(y_val_tensor.numpy(), predicted.numpy())
+            f1 = f1_score(y_val_tensor.numpy(), predicted.numpy(), zero_division=0)
+
+        return model_name, acc, f1, "✅ trained"
+
+    except Exception as e:
+        return model_name, None, None, f"❌ error: {type(e).__name__}: {str(e)}"
+
+
 
 def main():
-    stats = []
-    for tf in TIMEFRAMES:
-        for target in TARGETS:
-            try:
-                train_and_save(tf, target, stats)
-            except Exception as e:
-                print(f"❌ Помилка {tf} {target}: {e}")
+    os.makedirs("Models/CNN", exist_ok=True)
+    results = []
+    total = len(TIMEFRAMES) * len(TARGETS) * len(VARIANT_FEATURE_SETS)
 
-    # 📊 Фінальна таблиця
-    df_stats = pd.DataFrame(stats)
-    print("\n📈 Підсумкова статистика моделей:")
-    print(df_stats.to_string(index=False))
+    with tqdm(total=total, desc="🧠 Training CNN models") as pbar:
+        for timeframe in TIMEFRAMES:
+            for target in TARGETS:
+                for variant_id, features in VARIANT_FEATURE_SETS.items():
+                    model_name, acc, f1, status = train_model(timeframe, target, variant_id, features)
+                    results.append({
+                        "model": model_name,
+                        "accuracy": acc,
+                        "f1_score": f1,
+                        "status": status
+                    })
+                    print(f"{model_name}: {status}")
+                    pbar.update(1)
+
+    df = pd.DataFrame(results)
+    df.to_csv("Models/CNN/cnn_training_results.csv", index=False)
+    print("📊 Results saved to Models/CNN/cnn_training_results.csv")
 
 
 if __name__ == "__main__":
