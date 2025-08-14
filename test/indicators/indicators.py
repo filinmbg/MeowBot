@@ -173,11 +173,11 @@ def add_critical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    base_dir = "test/data/BTCUSDT"
+    base_dir = "test/data/ETHUSDT"   # ← було BTCUSDT
     files = glob.glob(os.path.join(base_dir, "*.csv.gz"))
 
     for file_path in files:
-        if "BTCUSDT_1m" in file_path:
+        if "ETHUSDT_1m" in file_path:   # ← було BTCUSDT_1m
             print(f"⏭ Пропускаємо 1m файл: {file_path}")
             continue
 

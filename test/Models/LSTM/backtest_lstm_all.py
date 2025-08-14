@@ -7,9 +7,9 @@ from torch import nn
 from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-MODEL_DIR = "Models/LSTM/saved_models"
+MODEL_DIR = "mmodels/LSTM/saved_models"
 DATA_DIR = "test/data/BTCUSDT"
-RESULT_CSV = "Models/LSTM/lstm_backtest_results.csv"
+RESULT_CSV = "mmodels/LSTM/lstm_backtest_results.csv"
 M1_FILE = os.path.join(DATA_DIR, "BTCUSDT_1m.csv.gz")
 BALANCE_INIT = 100.0
 RISK_PCT = 0.01

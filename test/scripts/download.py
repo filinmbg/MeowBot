@@ -1,66 +1,124 @@
+# test/scripts/download.py
 import sys
 import os
 import gzip
 import time
-from datetime import datetime, timedelta
+import asyncio
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
-# Додаємо шлях до binance_connector
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
-from binance_connector.client import get_klines
-
+# ── Налаштування ──────────────────────────────────────────────────────────────
 SYMBOL = "ETHUSDT"
+
 INTERVALS = {
     "1m": 60,
     "15m": 60 * 15,
     "30m": 60 * 30,
     "1h": 60 * 60,
-    "4h": 60 * 60 * 4,
-    "1d": 60 * 60 * 24
+    "4h": 4 * 60 * 60,
+    "1d": 24 * 60 * 60,
 }
-START_DATE = datetime(2022, 1, 1)
-MAX_LIMIT = 1500
 
+MAX_LIMIT = 1000
+START_DAYS_BACK = 30
 OUTDIR = os.path.join("test", "data", SYMBOL)
-os.makedirs(OUTDIR, exist_ok=True)
 
+# ── Імпорт клієнта (надiйний) ────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[2]  # .../MeowBot
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-def progress_bar(tag, current, total):
-    percent = (current / total) * 100
-    bar = f"[{'#' * int(percent // 2):<50}]"
-    sys.stdout.write(f"\r{tag:<4}: {bar} {percent:.2f}%")
-    sys.stdout.flush()
+try:
+    # варіант коли binance_conn.py лежить у корені проєкту
+    from binance_conn import get_klines  # async функція
+except ModuleNotFoundError:
+    try:
+        # варіант коли файл у пакеті binance_connector/binance_conn.py
+        from binance_connector.binance_conn import get_klines  # async функція
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "Не знайдено модуль 'binance_conn'. "
+            "Переконайся, що файл 'binance_conn.py' в корені проєкту АБО "
+            "існує пакет 'binance_connector/binance_conn.py' (з __init__.py). "
+            f"Шлях, доданий у sys.path: {ROOT}"
+        ) from e
 
+# ── Хелпери ──────────────────────────────────────────────────────────────────
+def now_utc() -> datetime:
+    return datetime.now(tz=timezone.utc)
 
-def download_interval(interval, seconds_per_bar):
-    print(f"\n📥 Завантаження {interval}...")
-    now = datetime.utcnow()
-    total_secs = (now - START_DATE).total_seconds()
-    total_bars = int(total_secs // seconds_per_bar)
+def ms_to_dt(ms: int) -> datetime:
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
 
-    start = START_DATE
-    all_data = []
-    bar_count = 0
+def last_close_dt_from_chunk(raw_rows) -> datetime:
+    if not raw_rows:
+        raise ValueError("Порожній чанк свічок — нема з чого взяти closeTime")
+    close_ms = int(raw_rows[-1][6])  # [6] closeTime(ms)
+    return ms_to_dt(close_ms)
 
-    while start < now:
-        data = get_klines(SYMBOL, interval, start, limit=MAX_LIMIT)
-        if not data:
+def ensure_outdir():
+    os.makedirs(OUTDIR, exist_ok=True)
+
+# ── Основна логіка ───────────────────────────────────────────────────────────
+def download_interval(interval: str, seconds_per_bar: int):
+    print(f"\n📥 Завантаження {interval} для {SYMBOL}...")
+    ensure_outdir()
+
+    # Стартова точка (якщо файл вже є — перехопимо нижче)
+    start_dt = now_utc() - timedelta(days=START_DAYS_BACK)
+
+    # Дозавантаження з останнього бару, якщо файл існує
+    outfile = os.path.join(OUTDIR, f"{SYMBOL}_{interval}.csv.gz")
+    if os.path.exists(outfile):
+        try:
+            with gzip.open(outfile, "rt", encoding="utf-8") as f:
+                last_line = None
+                for line in f:
+                    last_line = line
+            if last_line:
+                parts = last_line.strip().split(",")
+                last_close_ms = int(parts[6])  # [6] closeTime
+                start_dt = ms_to_dt(last_close_ms) + timedelta(seconds=seconds_per_bar)
+        except Exception:
+            # якщо файл пошкоджений — стартуємо з дефолтної давнини
+            pass
+
+    to_append = []
+
+    while True:
+        # КЛЮЧОВЕ: async-функція викликається через asyncio.run і з явним start_time=
+        chunk = asyncio.run(
+            get_klines(
+                SYMBOL,
+                interval,
+                start_time=start_dt,
+                limit=MAX_LIMIT
+            )
+        )
+
+        if not chunk:
             break
 
-        all_data.extend(data)
-        bar_count += len(data)
-        progress_bar(interval, bar_count, total_bars)
+        to_append.extend(chunk)
 
-        last_close = datetime.fromtimestamp(data[-1][0] / 1000)
-        start = last_close + timedelta(seconds=seconds_per_bar)
-        time.sleep(0.3)
+        last_close = last_close_dt_from_chunk(chunk)
 
-    outfile = os.path.join(OUTDIR, f"{SYMBOL}_{interval}.csv.gz")
-    with gzip.open(outfile, "wt", encoding="utf-8") as f:
-        for row in all_data:
-            f.write(",".join(map(str, row)) + "\n")
+        # зупинка, якщо ми вже дістались «майже до зараз»
+        if (now_utc() - last_close).total_seconds() < seconds_per_bar:
+            break
 
-    print(f"\n✅ {interval} — збережено {len(all_data)} рядків у {outfile}")
+        # посунутись далі
+        start_dt = last_close + timedelta(seconds=seconds_per_bar)
+        time.sleep(0.25)  # легкий тротл
 
+    # Запис / дозапис
+    mode = "ab" if os.path.exists(outfile) else "wb"
+    if to_append:
+        with gzip.open(outfile, mode) as f:
+            for r in to_append:
+                f.write( (",".join(map(str, r)) + "\n").encode("utf-8") )
+
+    print(f"✅ {interval} — додано {len(to_append)} рядків → {outfile}")
 
 if __name__ == "__main__":
     for interval, sec in INTERVALS.items():
