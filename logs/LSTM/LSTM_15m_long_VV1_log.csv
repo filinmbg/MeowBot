@@ -1,2 +1,0 @@
-epoch,train_loss,val_loss,val_acc,val_f1,best_f1
-1,0.636490,0.638647,0.663986,0.798067,0.798067

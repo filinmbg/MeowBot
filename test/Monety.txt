@@ -1,0 +1,87 @@
+Запуск і перші лістинги (липень–серпень 2017)
+Дата	Токен(и)	Примітка
+2017-07-14	BNB, BTC, ETH, LTC, NEO	запуск біржі
+2017-07-27	QTUM, SNT, EOS, BNT	додані пари
+2017-08-03	GAS	лістинг
+2017-08-05	BTM	лістинг
+2017-08-15	HCC	лістинг
+2017-08-18	HSR (HCash)	лістинг
+2017-08-21	OAX	лістинг
+2017-08-22	DNT	лістинг
+2017-08-23	MCO, ICN	лістинг
+2017-08-24	ELC	лістинг
+2017-08-27	WTC	лістинг
+
+Джерело для всього блоку: офіційний допис «Binance.com Stats 2017/8/27», який містить історію подій і переліки цих лістингів.
+Binance
+
+Вересень–грудень 2017 (оголошення про лістинг)
+Дата	Токен	Посилання на анонс
+2017-09-12	OMG	«Binance Will List OMG Market» (анонс 2017-09-09 з датою відкриття торгів 09-12).
+Binance
+
+2017-09-28	LINK	«Binance Lists LINK».
+Binance
+
+2017-09-30	SALT	«Binance Lists SALT».
+Binance
+
+2017-10-05	MDA	«Binance Lists MDA».
+Binance
+
+2017-10-09	MTL	«Binance Lists MTL».
+Binance
+
+2017-10-10	SUB	«Binance Lists SUB».
+Binance
+
+2017-10-12	ETC	«Binance Lists ETC».
+Binance
+
+2017-10-13	MTH	«Binance Lists MTH».
+Binance
+
+2017-10-20	DASH	«Binance Lists DASH».
+Binance
+
+2017-10-30	VIB	«Binance Lists VIB».
+Binance
+
+2017-11-01	POWR	«Binance Lists POWR».
+Binance
+
+2017-11-09	NULS	«Binance Adds NULS/BTC and NULS/ETH Trading Pairs».
+Binance
+
+2017-11-10	XMR	«Binance Lists XMR».
+Binance
+
+2017-11-14	BCPT	«Binance Lists BCPT».
+Binance
+
+2017-11-23	FUEL	«Binance Lists FUEL».
+Binance
+
+2017-11-30	ADA	«Binance Lists ADA».
+Binance
+
+2017-12-08	XLM	«Binance Lists XLM».
+Binance
+
+2017-12-15	TNB	«Binance Lists Time New Bank (TNB)».
+Binance
+
+2017-12-18	ICX	«Binance Lists ICON (ICX)».
+Binance
+
+2017-12-22	NEBL	«Binance Lists Neblio (NEBL)».
+Binance
+
+2017-12-24	BRD	«Binance Distributes and Lists BRD».
+Binance
+
+2017-12-27	NAV	«Binance Lists NAV Coin (NAV)».
+Binance
+
+2017-10-18†	IOTA	підтвердження лістингу через «IOTA Trading Bounty» (подія запуску торгів).
+Binance

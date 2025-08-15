@@ -1,8 +1,10 @@
 # test/start_train.py
 # Unified pipeline: download → indicators → targets → train (all models)
 # 1m: за замовчуванням тільки завантаження (індикатори/таргети пропускаємо)
+# + Прискорене завантаження: requests.Session з пулом з'єднань, швидкий gzip-запис, регульований throttle
+# + Скіп етапів за наявністю вихідних файлів (з прапорцями --force-*)
+# + NEW: у stage_train моделі, що краще працюють на GPU, запускаються з CUDA (авто/за прапорцем)
 
-# ── Path bootstrap ────────────────────────────────────────────────────────────
 import sys, os, importlib, importlib.util, subprocess, gzip, time, argparse, asyncio, threading, inspect
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -12,15 +14,23 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm  # прогрес-бар (Stage 1 і стадійні кроки)
 
+# ── Шляхи ─────────────────────────────────────────────────────────────────────
 THIS = Path(__file__).resolve()           # .../test/start_train.py
 ROOT = THIS.parents[1]                    # корінь проєкту (рівень вище за 'test')
 for p in {str(ROOT), str(THIS.parent)}:   # додаємо і корінь, і папку test
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# ── Надійне підвантаження get_klines з різних місць + HTTP fallback ──────────
+# ── Надійне підвантаження get_klines з різних місць + швидкий HTTP-fallback ─
 def resolve_get_klines():
-    # 1) Стандартні імпорти
+    """
+    Повертає async-функцію get_klines(symbol, interval, start_time=None, end_time=None, limit=500)
+    1) Імпорт із binance_conn / binance_connector.binance_conn / локальних файлів
+       (ігноруємо модулі, що не вантажаться через відсутні залежності — продовжуємо пошук)
+    2) Якщо нічого не знайшли — HTTP-fallback на https://api.binance.com/api/v3/klines з requests.Session
+    """
+
+    # 1) Стандартні імпорти з модулів
     try:
         from binance_conn import get_klines as gk
         return gk
@@ -31,7 +41,8 @@ def resolve_get_klines():
         return gk
     except Exception:
         pass
-    # 2) Пошук файлів
+
+    # 2) Пошук локальних файлів і толерантне завантаження
     candidates = [
         ROOT / "binance_conn.py",
         ROOT / "binance_connector" / "binance_conn.py",
@@ -40,20 +51,30 @@ def resolve_get_klines():
     ]
     for path in candidates:
         if path.exists():
-            spec = importlib.util.spec_from_file_location("binance_conn_dynamic", path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            if hasattr(mod, "get_klines"):
-                return mod.get_klines
-    # 3) HTTP-fallback
+            try:
+                spec = importlib.util.spec_from_file_location("binance_conn_dynamic", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # може кинути, напр., ModuleNotFoundError: dotenv
+                if hasattr(mod, "get_klines"):
+                    return mod.get_klines
+            except Exception:
+                # якщо модуль не імпортується через залежності — пропускаємо і йдемо далі
+                continue
+
+    # 3) HTTP-fallback: швидка сесія з пулом з'єднань
     import asyncio
     try:
         import requests
     except Exception as e:
         raise ModuleNotFoundError(
-            "Не знайдено ні 'binance_conn.py', ні пакет 'binance_connector'. "
-            "А також відсутній 'requests' для HTTP-fallback. Встанови: pip install requests"
+            "Не знайдено 'get_klines' у локальних модулях і відсутній 'requests' для HTTP-fallback. "
+            "Встанови: pip install requests"
         ) from e
+
+    _session = requests.Session()
+    _adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=3)
+    _session.mount("https://", _adapter)
+    _session.headers.update({"Accept-Encoding": "gzip, deflate", "Connection": "keep-alive"})
 
     def _to_ms(t):
         if t is None:
@@ -83,11 +104,15 @@ def resolve_get_klines():
 
     def _http_get_klines(symbol, interval, start_time=None, end_time=None, limit=500):
         url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": str(symbol).upper(), "interval": str(interval), "limit": max(1, min(int(limit), 1000))}
+        params = {
+            "symbol": str(symbol).upper(),
+            "interval": str(interval),
+            "limit": max(1, min(int(limit), 1000)),
+        }
         st = _to_ms(start_time); et = _to_ms(end_time)
         if st is not None: params["startTime"] = st
         if et is not None: params["endTime"] = et
-        r = requests.get(url, params=params, timeout=30)
+        r = _session.get(url, params=params, timeout=30)
         r.raise_for_status()
         return r.json()
 
@@ -110,7 +135,7 @@ def _import_first_ok(mod_names: List[str]):
 def _candidate_paths_for(filename: str) -> List[Path]:
     cands = [
         ROOT / filename,
-        THIS.parent / filename,
+        THIS.parent / filename,                 # test/<filename>
         ROOT / "test" / filename,
         ROOT / "test" / "scripts" / filename,
         ROOT / "scripts" / filename,
@@ -129,7 +154,9 @@ def _candidate_paths_for(filename: str) -> List[Path]:
             uniq.append(p); seen.add(str(p))
     return uniq
 
-def _resolve_function(module_name_candidates: List[str], func_candidates: List[str], file_name: str) -> Callable:
+def _resolve_function(module_name_candidates: List[str],
+                      func_candidates: List[str],
+                      file_name: str) -> Callable:
     mod = _import_first_ok(module_name_candidates)
     if mod:
         for fn in func_candidates:
@@ -203,7 +230,7 @@ def run_with_spinner(fn: Callable, desc: str):
         raise result_holder["error"]
     return result_holder["value"]
 
-# ── Константи інтервалів (сек/бар) ───────────────────────────────────────────
+# ── Інтервали (сек/бар) ──────────────────────────────────────────────────────
 BINANCE_STEPS = {
     "1m": 60, "15m": 60*15, "30m": 60*30,
     "1h": 60*60, "4h": 4*60*60, "1d": 24*60*60,
@@ -226,7 +253,7 @@ def last_close_from_gz(path: str) -> Optional[int]:
         return None
     return None
 
-# ── Stage 1: Download (progress by requests) ─────────────────────────────────
+# ── Stage 1: Download (progress by requests + швидкий I/O) ──────────────────
 async def fetch_chunk(symbol: str, interval: str, start_dt: datetime, limit: int) -> List[List]:
     rows = await get_klines(symbol, interval, start_time=start_dt, limit=limit)
     return rows or []
@@ -237,8 +264,13 @@ def _bars_between(a: datetime, b: datetime, step_sec: int) -> int:
     return int((b - a).total_seconds() // step_sec) + 1
 
 def download_interval(symbol: str, data_dir: str, interval: str, limit: int = 1000,
-                      earliest: Optional[datetime] = None, throttle_s: float = 0.15,
+                      earliest: Optional[datetime] = None, throttle_s: float = 0.05,
                       show_progress: bool = True) -> int:
+    """
+    Дозавантажує свічки у {data_dir}/{symbol}_{interval}.csv.gz
+    Повертає кількість доданих рядків.
+    Прогрес показуємо за кількістю HTTP-запитів (чанків).
+    """
     ensure_dir(data_dir)
     outfile = os.path.join(data_dir, f"{symbol}_{interval}.csv.gz")
     step = BINANCE_STEPS[interval]
@@ -263,10 +295,11 @@ def download_interval(symbol: str, data_dir: str, interval: str, limit: int = 10
         if not rows:
             break
 
+        # швидкий запис одним блоком у gzip (менше I/O викликів)
+        block = "".join(",".join(map(str, r)) + "\n" for r in rows).encode("utf-8")
         mode = "ab" if os.path.exists(outfile) else "wb"
         with gzip.open(outfile, mode) as f:
-            for r in rows:
-                f.write( (",".join(map(str, r)) + "\n").encode("utf-8") )
+            f.write(block)
         appended += len(rows)
 
         req_done += 1
@@ -276,6 +309,7 @@ def download_interval(symbol: str, data_dir: str, interval: str, limit: int = 10
         last_close_ms = int(rows[-1][6])
         last_close_dt = ms_to_dt(last_close_ms)
 
+        # якщо близько до "тепер" — завершуємо
         if (now_fixed - last_close_dt).total_seconds() < step:
             break
 
@@ -290,14 +324,18 @@ def download_interval(symbol: str, data_dir: str, interval: str, limit: int = 10
     return appended
 
 def stage_download(symbol: str, data_dir: str, intervals: List[str], start: Optional[str], limit: int,
-                   show_progress: bool) -> None:
+                   show_progress: bool, throttle_s: float, force_download: bool) -> None:
     print(f"\n🧩 Stage 1/4 — Download bars for {symbol}")
     earliest = dt_parse(start) if start else None
     for itv in intervals:
+        outfile = os.path.join(data_dir, f"{symbol}_{itv}.csv.gz")
+        if os.path.exists(outfile) and not force_download:
+            print(f"  ⏭ {itv}: raw already exists → skip download")
+            continue
         print(f"  📥 {itv} ...")
         try:
             added = download_interval(symbol, data_dir, itv, limit=limit, earliest=earliest,
-                                      throttle_s=0.15, show_progress=show_progress)
+                                      throttle_s=throttle_s, show_progress=show_progress)
             print(f"    ✅ {itv}: +{added} rows")
         except Exception as e:
             print(f"    ❌ {itv}: {type(e).__name__}: {e}")
@@ -309,10 +347,13 @@ RAW_COLS = [
     "taker_buy_base_volume","taker_buy_quote_volume","ignore"
 ]
 
-def need_build_indicators(raw_gz: str, out_csv: str) -> bool:
-    if not os.path.exists(out_csv):
+def need_build_indicators(raw_gz: str, out_csv: str, force_indicators: bool) -> bool:
+    """
+    Рахуємо лише якщо файлу немає АБО явно задано --force-indicators.
+    """
+    if force_indicators:
         return True
-    return os.path.getmtime(out_csv) < os.path.getmtime(raw_gz)
+    return not os.path.exists(out_csv)
 
 def _call_add_indicators_with_optional_progress(df: pd.DataFrame) -> pd.DataFrame:
     sig = None
@@ -344,7 +385,7 @@ def build_indicators_for_file(raw_gz: str, out_csv: str) -> int:
     run_with_spinner(lambda: df.to_csv(out_csv, index=False), "     write indicators")
     return len(df)
 
-def stage_indicators(symbol: str, data_dir: str, intervals: List[str], skip_1m: bool) -> None:
+def stage_indicators(symbol: str, data_dir: str, intervals: List[str], skip_1m: bool, force_indicators: bool) -> None:
     print(f"\n🧩 Stage 2/4 — Indicators for {symbol}")
     for itv in intervals:
         if skip_1m and itv == "1m":
@@ -356,21 +397,23 @@ def stage_indicators(symbol: str, data_dir: str, intervals: List[str], skip_1m: 
             continue
         out_csv = os.path.join(data_dir, f"{symbol}_{itv}_critical_indicators.csv")
         try:
-            if need_build_indicators(raw, out_csv):
+            if need_build_indicators(raw, out_csv, force_indicators):
                 print(f"  🧮 {itv}:")
                 n = build_indicators_for_file(raw, out_csv)
                 print(f"     done → {os.path.basename(out_csv)} ({n} rows)")
             else:
-                print(f"  ⏭ {itv}: indicators up-to-date")
+                print(f"  ⏭ {itv}: indicators exist → skip")
         except Exception as e:
             print(f"  ❌ {itv}: {type(e).__name__}: {e}")
 
 # ── Stage 3: Targets (1m — skip за замовчуванням) ────────────────────────────
-def need_build_targets(inp_csv: str, out_long: str, out_short: str) -> bool:
-    if not (os.path.exists(out_long) and os.path.exists(out_short)):
+def need_build_targets(inp_csv: str, out_long: str, out_short: str, force_targets: bool) -> bool:
+    """
+    Рахуємо лише якщо НЕМАЄ обох вихідних файлів АБО явно --force-targets.
+    """
+    if force_targets:
         return True
-    latest_out = max(os.path.getmtime(out_long), os.path.getmtime(out_short))
-    return latest_out < os.path.getmtime(inp_csv)
+    return not (os.path.exists(out_long) and os.path.exists(out_short))
 
 def _call_add_targets_with_optional_progress(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
     sig = None
@@ -419,7 +462,7 @@ def build_targets_for_file(inp_csv: str, out_dir: str,
 def stage_targets(symbol: str, data_dir: str, intervals: List[str],
                   atr_period=14, atr_kind="wilder",
                   tp_mult=0.5, sl_mult=1.0, lookahead=10, fee=0.0005,
-                  skip_1m: bool = True) -> None:
+                  skip_1m: bool = True, force_targets: bool = False) -> None:
     print(f"\n🧩 Stage 3/4 — Targets for {symbol}")
     for itv in intervals:
         if skip_1m and itv == "1m":
@@ -432,12 +475,12 @@ def stage_targets(symbol: str, data_dir: str, intervals: List[str],
         out_long  = os.path.join(data_dir, f"{symbol}_{itv}_critical_indicators_with_targets_long.csv")
         out_short = os.path.join(data_dir, f"{symbol}_{itv}_critical_indicators_with_targets_short.csv")
         try:
-            if need_build_targets(inp_csv, out_long, out_short):
+            if need_build_targets(inp_csv, out_long, out_short, force_targets):
                 print(f"  🎯 {itv}:")
                 build_targets_for_file(inp_csv, data_dir, atr_period, atr_kind, tp_mult, sl_mult, lookahead, fee)
                 print(f"     done")
             else:
-                print(f"  ⏭ {itv}: targets up-to-date")
+                print(f"  ⏭ {itv}: targets exist → skip")
         except Exception as e:
             print(f"  ❌ {itv}: {type(e).__name__}: {e}")
 
@@ -454,43 +497,68 @@ def torch_cuda_available() -> bool:
     except Exception:
         return False
 
+def choose_device(device_pref: Optional[str]) -> str:
+    """Вертає 'cuda' якщо device_pref='cuda' або якщо CUDA доступна; інакше 'cpu'."""
+    if device_pref:
+        return device_pref
+    return "cuda" if torch_cuda_available() else "cpu"
+
 def stage_train(symbol: str, device_pref: Optional[str]) -> None:
     print(f"\n🧩 Stage 4/4 — Train models for {symbol}")
 
-    rc = run_subprocess_module("test.Models.CNN.train_cnn_crypto", ["--symbol", symbol])
+    # ── CNN → GPU якщо є (бо конволюції значно швидші)
+    cnn_device = choose_device(device_pref)
+    rc = run_subprocess_module(
+        "test.Models.CNN.train_cnn_crypto",
+        ["--symbol", symbol, "--device", cnn_device]
+    )
     if rc != 0:
         print("   ⚠️ CNN trainer returned non-zero exit code.")
 
-    lstm_args = ["--symbol", symbol]
-    if device_pref:
-        lstm_args += ["--device", device_pref]
-    rc = run_subprocess_module("test.Models.LSTM.train_lstm_crypto", lstm_args)
+    # ── LSTM → GPU якщо є
+    lstm_device = choose_device(device_pref)
+    rc = run_subprocess_module(
+        "test.Models.LSTM.train_lstm_crypto",
+        ["--symbol", symbol, "--device", lstm_device]
+    )
     if rc != 0:
         print("   ⚠️ LSTM trainer returned non-zero exit code.")
 
-    ppo_device = device_pref or ("cuda" if torch_cuda_available() else "cpu")
-    rc = run_subprocess_module("test.Models.PPO.ppo_train", ["--symbol", symbol, "--device", ppo_device])
+    # ── PPO → GPU для політики/критика
+    ppo_device = choose_device(device_pref)
+    rc = run_subprocess_module(
+        "test.Models.PPO.ppo_train",
+        ["--symbol", symbol, "--device", ppo_device]
+    )
     if rc != 0:
         print("   ⚠️ PPO trainer returned non-zero exit code.")
 
-    rc = run_subprocess_module("test.Models.DQN.train_all_dqn", ["--symbol", symbol] + (["--device", device_pref] if device_pref else []))
+    # ── DQN → GPU якщо є
+    dqn_device = choose_device(device_pref)
+    rc = run_subprocess_module(
+        "test.Models.DQN.train_all_dqn",
+        ["--symbol", symbol, "--device", dqn_device]
+    )
     if rc != 0:
         print("   ⚠️ DQN trainer returned non-zero exit code.")
 
-    tr_args = ["--symbol", symbol]
-    if device_pref:
-        tr_args += ["--device", device_pref]
-    rc = run_subprocess_module("test.Models.Transformer.train_all_transformers", tr_args)
+    # ── Transformers → GPU якщо є
+    tr_device = choose_device(device_pref)
+    rc = run_subprocess_module(
+        "test.Models.Transformer.train_all_transformers",
+        ["--symbol", symbol, "--device", tr_device]
+    )
     if rc != 0:
         print("   ⚠️ Transformer trainer returned non-zero exit code.")
 
-    xgb_args = ["--symbol", symbol]
-    if (device_pref or "").lower() == "cuda":
-        xgb_args += ["--gpu"]
+    # ── XGBoost → --gpu якщо CUDA доступна/попросили
+    xgb_use_gpu = (choose_device(device_pref) == "cuda")
+    xgb_args = ["--symbol", symbol] + (["--gpu"] if xgb_use_gpu else [])
     rc = run_subprocess_module("test.Models.XGBoost.train_all_xgboost", xgb_args)
     if rc != 0:
         print("   ⚠️ XGBoost trainer returned non-zero exit code.")
 
+    # ── QLearning (табличний) → CPU
     rc = run_subprocess_module("test.Models.QLearning.train_all_qlearning", ["--symbol", symbol])
     if rc != 0:
         print("   ⚠️ QLearning trainer returned non-zero exit code.")
@@ -502,15 +570,17 @@ def main():
     ap.add_argument("--intervals", default="1m,15m,30m,1h,4h,1d", help="comma-separated list")
     ap.add_argument("--start", default=None, help="earliest start date YYYY-MM-DD (if files absent), default=2017-01-01")
     ap.add_argument("--limit", type=int, default=1000, help="max klines per request")
-    # за замовчуванням: 1m індикатори/таргети — пропуск
-    ap.add_argument("--skip-1m-ind", dest="skip_1m_ind", action="store_true", default=True,
-                    help="skip indicators for 1m (default)")
-    ap.add_argument("--no-skip-1m-ind", dest="skip_1m_ind", action="store_false",
-                    help="do not skip indicators for 1m")
-    ap.add_argument("--skip-1m-targets", dest="skip_1m_targets", action="store_true", default=True,
-                    help="skip targets for 1m (default)")
-    ap.add_argument("--no-skip-1m-targets", dest="skip_1m_targets", action="store_false",
-                    help="do not skip targets for 1m")
+    ap.add_argument("--throttle", type=float, default=0.05, help="delay between requests in seconds (Stage 1)")
+    # скіпи/форси
+    ap.add_argument("--force-download", action="store_true", help="перекачати навіть якщо raw існує")
+    ap.add_argument("--force-indicators", action="store_true", help="перерахувати індикатори навіть якщо файл існує")
+    ap.add_argument("--force-targets", action="store_true", help="перерахувати таргети навіть якщо файли існують")
+    # 1m індикатори/таргети — пропуск за замовчуванням
+    ap.add_argument("--skip-1m-ind", dest="skip_1m_ind", action="store_true", default=True, help="skip indicators for 1m (default)")
+    ap.add_argument("--no-skip-1m-ind", dest="skip_1m_ind", action="store_false", help="do not skip indicators for 1m")
+    ap.add_argument("--skip-1m-targets", dest="skip_1m_targets", action="store_true", default=True, help="skip targets for 1m (default)")
+    ap.add_argument("--no-skip-1m-targets", dest="skip_1m_targets", action="store_false", help="do not skip targets for 1m")
+    # тренування
     ap.add_argument("--device", choices=["cpu","cuda"], default=None, help="preferred device for supported trainers")
     ap.add_argument("--atr-period", type=int, default=14)
     ap.add_argument("--atr-kind", default="wilder", choices=["wilder","sma","ema"])
@@ -527,20 +597,21 @@ def main():
 
     intervals = [s.strip() for s in args.intervals.split(",") if s.strip()]
 
-    # 1) download
+    # 1) download (пропускаємо, якщо raw існує і не --force-download)
     stage_download(symbol, data_dir, intervals, start=args.start, limit=args.limit,
-                   show_progress=not args.no_progress)
+                   show_progress=not args.no_progress, throttle_s=args.throttle,
+                   force_download=args.force_download)
 
-    # 2) indicators (1m пропускаємо за замовч.)
-    stage_indicators(symbol, data_dir, intervals, skip_1m=args.skip_1m_ind)
+    # 2) indicators (1m пропускаємо за замовч., а також скіпимо якщо файл існує і не --force-indicators)
+    stage_indicators(symbol, data_dir, intervals, skip_1m=args.skip_1m_ind, force_indicators=args.force_indicators)
 
-    # 3) targets    (1m пропускаємо за замовч.)
+    # 3) targets    (1m пропускаємо за замовч., а також скіпимо якщо обидва файли існують і не --force-targets)
     stage_targets(
         symbol, data_dir, intervals,
         atr_period=args.atr_period, atr_kind=args.atr_kind,
         tp_mult=args.tp_mult, sl_mult=args.sl_mult,
         lookahead=args.lookahead, fee=args.fee,
-        skip_1m=args.skip_1m_targets
+        skip_1m=args.skip_1m_targets, force_targets=args.force_targets
     )
 
     # 4) training
