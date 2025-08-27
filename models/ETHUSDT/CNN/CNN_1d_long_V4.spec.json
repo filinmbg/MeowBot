@@ -1,0 +1,14 @@
+{
+  "features": [
+    "macd",
+    "bb_upper",
+    "bb_middle",
+    "bb_lower"
+  ],
+  "lookback": 64,
+  "target_col": "target_long",
+  "in_channels": 4,
+  "created": "2025-08-15T14:17:28.196035Z",
+  "model_file": "CNN_1d_long_V4.pt",
+  "scaler_file": "CNN_1d_long_V4.scaler.npz"
+}

@@ -10,12 +10,28 @@ import warnings
 import importlib.util
 from typing import List, Tuple
 
+import logging
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, f1_score
 
 import xgboost as xgb
+
+import importlib.util, pathlib
+
+_THIS = pathlib.Path(__file__).resolve()
+_CFG  = _THIS.parent / "configs.py"
+
+spec = importlib.util.spec_from_file_location("model_configs", _CFG)
+_cfg = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(_cfg)
+
+TIMEFRAMES = _cfg.TIMEFRAMES
+TARGETS = _cfg.TARGETS
+VARIANT_FEATURE_SETS = _cfg.VARIANT_FEATURE_SETS
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -60,17 +76,41 @@ def ensure_dirs(*paths: str):
     for p in paths:
         os.makedirs(p, exist_ok=True)
 
+def _norm(p: str | None) -> str:
+    return (p or "").replace("\\", "/").rstrip("/").lower()
+
 def compute_paths(symbol: str,
                   data_root: str = "test/data",
                   models_dir: str | None = None,
                   logs_dir: str | None = None) -> tuple[str, str, str]:
+    """
+    Нова схема за замовчуванням:
+      models/<SYMBOL>/XGBoost
+      logs/<SYMBOL>/XGBoost
+    Якщо користувач передав свої --models-dir/--logs-dir — використовуємо як є.
+    """
     symbol = symbol.upper()
     data_dir = os.path.join(data_root, symbol)
-    default_models = "models/XGBoost" if symbol == "BTCUSDT" else f"models/XGBoost_{symbol}"
-    default_logs   = "logs/XGBoost"   if symbol == "BTCUSDT" else f"logs/XGBoost_{symbol}"
-    models_dir = models_dir or default_models
-    logs_dir   = logs_dir or default_logs
+
+    if models_dir is None or _norm(models_dir) == "models/xgboost":
+        models_dir = os.path.join("models", symbol, "XGBoost")
+    if logs_dir is None or _norm(logs_dir) == "logs/xgboost":
+        logs_dir = os.path.join("logs", symbol, "XGBoost")
+
     return data_dir, models_dir, logs_dir
+
+def setup_single_file_logger(log_dir: str) -> logging.Logger:
+    ensure_dirs(log_dir)
+    logger = logging.getLogger(f"xgb_train_{int(datetime.now().timestamp())}")
+    logger.setLevel(logging.INFO)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fh = logging.FileHandler(os.path.join(log_dir, f"train_{ts}.log"), encoding="utf-8")
+    ch = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    fh.setFormatter(fmt); ch.setFormatter(fmt)
+    logger.addHandler(fh); logger.addHandler(ch)
+    logger.propagate = False
+    return logger
 
 # =======================
 # Data utils
@@ -284,6 +324,9 @@ def main():
 
     ensure_dirs(MODEL_DIR, LOG_DIR)
 
+    logger = setup_single_file_logger(LOG_DIR)
+    logger.info(f"start symbol={SYMBOL} data={DATA_DIR} models={MODEL_DIR} logs={LOG_DIR} gpu={args.gpu}")
+
     results = []
     total = len(TIMEFRAMES) * len(TARGETS) * len(VARIANT_FEATURE_SETS)
     with tqdm(total=total, desc="🧠 Training XGBoost models") as pbar:
@@ -294,7 +337,8 @@ def main():
                     model_path = os.path.join(MODEL_DIR, model_name + ".json")
 
                     if os.path.exists(model_path):
-                        print(f"{model_name}: ⏭️ already exists — skipped")
+                        msg = f"{model_name}: ⏭️ already exists — skipped"
+                        print(msg); logger.info(msg)
                         pbar.update(1)
                         continue
 
@@ -313,13 +357,16 @@ def main():
                         reg_lambda=args.reg_lambda,
                         gpu=args.gpu,
                     )
-                    print(f"{res['model']}: {res['status']} | acc={res['val_acc']}, f1={res['val_f1']}")
+                    msg = f"{res['model']}: {res['status']} | acc={res['val_acc']}, f1={res['val_f1']}"
+                    print(msg); logger.info(msg)
                     results.append(res)
                     pbar.update(1)
 
     pd.DataFrame(results).to_csv(RESULTS_CSV, index=False)
     print(f"📊 Results saved to {RESULTS_CSV}")
+    logger.info(f"results {RESULTS_CSV}")
     print(f"🧾 Features manifest: {FEATURES_MANIFEST}")
+    logger.info(f"manifest {FEATURES_MANIFEST}")
 
 if __name__ == "__main__":
     main()

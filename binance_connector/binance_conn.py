@@ -174,7 +174,7 @@ async def get_klines(
     interval: str,
     start_time: Optional[TimeLike] = None,
     end_time: Optional[TimeLike] = None,
-    limit: int = 500,
+    limit: int = 1000,  # було 500
 ):
     """
     /api/v3/klines з опц. start_time/end_time. Повертає "raw" масиви як у Binance.
@@ -189,7 +189,7 @@ async def get_klines(
     if end_time is not None:
         params["endTime"] = _to_millis(end_time)
 
-    limit = max(1, min(int(limit), 1000))
+    limit = max(1, min(int(limit), 1000))  # clamp лише тут
     params["limit"] = limit
 
     return await asyncio.to_thread(cli.klines, symbol, interval, **params)

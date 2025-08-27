@@ -12,7 +12,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from database.mongo.connection import init_mongo, is_connected as mongo_ok
 
 # Binance singleton
-from services.binance_conn import init_binance, is_connected as binance_ok, get_balances_nonzero
+from binance_connector.binance_conn import init_binance, is_connected as binance_ok, get_balances_nonzero
 
 logging.basicConfig(
     level=logging.INFO,

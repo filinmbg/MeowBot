@@ -5,7 +5,10 @@ import joblib
 import warnings
 import argparse
 import json
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
+
+import logging
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -14,20 +17,24 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.nn.utils import clip_grad_norm_
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score
 
-# ---- robust import of configs (workable for -m launch) -----------------------
-try:
-    from configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
-except Exception:
-    try:
-        from test.Models.configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
-    except Exception:
-        from configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
+import importlib.util, pathlib
 
+_THIS = pathlib.Path(__file__).resolve()
+_CFG  = _THIS.parent / "configs.py"
+
+spec = importlib.util.spec_from_file_location("model_configs", _CFG)
+_cfg = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(_cfg)
+
+TIMEFRAMES = _cfg.TIMEFRAMES
+TARGETS = _cfg.TARGETS
+VARIANT_FEATURE_SETS = _cfg.VARIANT_FEATURE_SETS
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # =======================
@@ -41,23 +48,17 @@ RESULTS_CSV = os.path.join(MODEL_DIR, "lstm_training_results.csv")
 FEATURES_MANIFEST = os.path.join(MODEL_DIR, "features_manifest.csv")
 
 # =======================
-# Reproducibility
+# Repro / device
 # =======================
 SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
-# =======================
-# Device
-# =======================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # =======================
-# Dir helpers
+# FS helpers
 # =======================
 def ensure_dirs(*paths: str):
     for p in paths:
@@ -66,41 +67,58 @@ def ensure_dirs(*paths: str):
 
 def compute_paths(symbol: str,
                   data_root: str = "test/data",
-                  models_dir: str | None = None,
-                  logs_dir: str | None = None) -> tuple[str, str, str]:
+                  models_dir: Optional[str] = None,
+                  logs_dir: Optional[str] = None) -> tuple[str, str, str]:
     """
-    Returns (data_dir, models_dir, logs_dir) based on symbol.
-    - For BTCUSDT keep legacy: models/LSTM, logs/LSTM
-    - For others: models/LSTM_<SYMBOL>, logs/LSTM_<SYMBOL>
+    Повертає (data_dir, models_dir, logs_dir) у форматі:
+      - models/<SYMBOL>/LSTM
+      - logs/<SYMBOL>/LSTM
+    Якщо передано власні --models-dir / --logs-dir — використовуємо їх як є.
     """
     symbol = symbol.upper()
     data_dir = os.path.join(data_root, symbol)
 
-    default_models = "models/LSTM" if symbol == "BTCUSDT" else f"models/LSTM_{symbol}"
-    default_logs   = "logs/LSTM"   if symbol == "BTCUSDT" else f"logs/LSTM_{symbol}"
+    def _norm(p: Optional[str]) -> str:
+        return (p or "").replace("\\", "/").rstrip("/").lower()
 
-    models_dir = models_dir or default_models
-    logs_dir   = logs_dir or default_logs
+    if models_dir is None or _norm(models_dir) == "models/lstm":
+        models_dir = os.path.join("models", symbol, "LSTM")
+    if logs_dir is None or _norm(logs_dir) == "logs/lstm":
+        logs_dir = os.path.join("logs", symbol, "LSTM")
+
     return data_dir, models_dir, logs_dir
 
 
+def setup_single_file_logger(log_dir: str) -> logging.Logger:
+    ensure_dirs(log_dir)
+    logger = logging.getLogger(f"lstm_train_{int(datetime.now().timestamp())}")
+    logger.setLevel(logging.INFO)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fh = logging.FileHandler(os.path.join(log_dir, f"train_{ts}.log"), encoding="utf-8")
+    ch = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    fh.setFormatter(fmt)
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    logger.propagate = False
+    return logger
+
+
 # =======================
-# Data utils
+# Data
 # =======================
 def load_dataframe(timeframe: str, target: str) -> pd.DataFrame:
-    csv_path = os.path.join(
-        DATA_DIR,
-        f"{SYMBOL}_{timeframe}_critical_indicators_with_targets_{target}.csv"
-    )
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(csv_path)
-    df = pd.read_csv(csv_path)
+    path = os.path.join(DATA_DIR, f"{SYMBOL}_{timeframe}_critical_indicators_with_targets_{target}.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    df = pd.read_csv(path)
+    # відсортуємо, якщо є часові колонки
     for col in ["timestamp", "time", "open_time", "date"]:
         if col in df.columns:
             df = df.sort_values(col).reset_index(drop=True)
             break
-    df = df.dropna().reset_index(drop=True)
-    return df
+    return df.dropna().reset_index(drop=True)
 
 
 def time_split_indices(n: int, val_ratio: float = 0.2) -> Tuple[np.ndarray, np.ndarray]:
@@ -110,46 +128,45 @@ def time_split_indices(n: int, val_ratio: float = 0.2) -> Tuple[np.ndarray, np.n
 
 
 def fit_scale_features(train_X: np.ndarray) -> StandardScaler:
-    scaler = StandardScaler()
-    scaler.fit(train_X)
-    return scaler
+    sc = StandardScaler()
+    sc.fit(train_X)
+    return sc
 
 
 def transform_features(scaler: StandardScaler, X: np.ndarray) -> np.ndarray:
-    Xs = scaler.transform(X).astype(np.float32)
-    return Xs
+    return scaler.transform(X).astype(np.float32)
 
 
 def build_sequences(X: np.ndarray, y: np.ndarray, seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Повертає:
+      X_seq: (N, T, F)
+      y_seq: (N, 1)
+    """
     n = len(X)
     if n < seq_len:
-        return np.empty((0, seq_len, X.shape[1]), dtype=np.float32), np.empty((0, 1), dtype=np.float32)
-
-    X_seq = []
-    y_seq = []
+        return np.empty((0, seq_len, X.shape[1]), np.float32), np.empty((0, 1), np.float32)
+    Xs, ys = [], []
     for t in range(seq_len - 1, n):
-        X_seq.append(X[t - seq_len + 1:t + 1])
-        y_seq.append([y[t]])
-    X_seq = np.array(X_seq, dtype=np.float32)
-    y_seq = np.array(y_seq, dtype=np.float32)
-    return X_seq, y_seq
+        Xs.append(X[t - seq_len + 1:t + 1])
+        ys.append([y[t]])
+    return np.asarray(Xs, np.float32), np.asarray(ys, np.float32)
 
 
+# =======================
+# Dataset / Model
+# =======================
 class SeqDataset(Dataset):
-    def __init__(self, X_seq: np.ndarray, y_seq: np.ndarray):
-        self.X = X_seq
-        self.y = y_seq
+    def __init__(self, X, y):
+        self.X, self.y = X, y
 
     def __len__(self):
         return len(self.X)
 
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+    def __getitem__(self, i):
+        return self.X[i], self.y[i]
 
 
-# =======================
-# Model
-# =======================
 class LSTMClassifier(nn.Module):
     def __init__(self, input_size: int, hidden_size: int = 64, num_layers: int = 2, dropout: float = 0.2):
         super().__init__()
@@ -159,37 +176,27 @@ class LSTMClassifier(nn.Module):
             num_layers=num_layers,
             dropout=dropout if num_layers > 1 else 0.0,
             batch_first=True,
-            bidirectional=False,
         )
         self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size, 1)
+        self.fc = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, 1)
+        )
 
-    def forward(self, x):  # x: (B, T, F)
-        out, _ = self.lstm(x)      # (B, T, H)
-        last = out[:, -1, :]       # (B, H)
-        last = self.dropout(last)
-        logits = self.fc(last)     # (B, 1)
-        return logits
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        last = self.dropout(out[:, -1, :])
+        return self.fc(last).squeeze(-1)  # logits [B]
 
 
 # =======================
-# Feature saving helpers
+# Save feature spec / scaler manifest
 # =======================
-def save_feature_spec(base_path_no_ext: str,
-                      model_name: str,
-                      timeframe: str,
-                      target: str,
-                      variant_id: str,
-                      features: List[str],
-                      seq_len: int,
-                      scaler: StandardScaler):
-    """
-    Зберігає:
-    - JSON із метаданими фіч та препроцесингу
-    - NPZ із статистикою скейлера (mean, scale, var)
-    - Рядок у загальний manifest CSV
-    """
-    # JSON
+def save_feature_spec(base_no_ext: str, model_name: str, timeframe: str, target: str,
+                      variant_id: str, features: List[str], seq_len: int, scaler: StandardScaler):
     spec = {
         "model_name": model_name,
         "symbol": SYMBOL,
@@ -199,29 +206,23 @@ def save_feature_spec(base_path_no_ext: str,
         "seq_len": int(seq_len),
         "features": list(features),
         "n_features": int(len(features)),
-        "preprocessing": {
-            "scaler": "StandardScaler",
-            "with_mean": True,
-            "with_std": True
-        },
-        "seed": int(SEED)
+        "preprocessing": {"scaler": "StandardScaler", "with_mean": True, "with_std": True},
+        "seed": int(SEED),
     }
-    with open(base_path_no_ext + ".features.json", "w", encoding="utf-8") as f:
+    # 👇 вирівнюємо з CNN: .spec.json
+    with open(base_no_ext + ".spec.json", "w", encoding="utf-8") as f:
         json.dump(spec, f, ensure_ascii=False, indent=2)
 
-    # NPZ
-    mean_ = getattr(scaler, "mean_", None)
-    scale_ = getattr(scaler, "scale_", None)
-    var_ = getattr(scaler, "var_", None)
+    mean_, scale_, var_ = getattr(scaler, "mean_", None), getattr(scaler, "scale_", None), getattr(scaler, "var_", None)
     if mean_ is not None and scale_ is not None:
         np.savez_compressed(
-            base_path_no_ext + ".scaler.npz",
+            base_no_ext + ".scaler.npz",
             mean_=mean_.astype(np.float32),
             scale_=scale_.astype(np.float32),
-            var_=(var_.astype(np.float32) if var_ is not None else (scale_ ** 2).astype(np.float32))
+            var_=(var_.astype(np.float32) if var_ is not None else (scale_**2).astype(np.float32)),
         )
 
-    # Manifest append
+    # Маніфест фіч (для зручної інспекції)
     row = {
         "model_name": model_name,
         "symbol": SYMBOL,
@@ -230,7 +231,7 @@ def save_feature_spec(base_path_no_ext: str,
         "variant_id": str(variant_id),
         "seq_len": int(seq_len),
         "n_features": int(len(features)),
-        "features_csv": "|".join(features)
+        "features_csv": "|".join(features),
     }
     if os.path.exists(FEATURES_MANIFEST):
         dfm = pd.read_csv(FEATURES_MANIFEST)
@@ -241,197 +242,208 @@ def save_feature_spec(base_path_no_ext: str,
 
 
 # =======================
-# Train one model
+# Metrics helpers
 # =======================
-def train_one(timeframe: str,
-              target: str,
-              variant_id: str,
-              features: List[str],
-              seq_len: int = 32,
-              batch_size: int = 256,
-              lr: float = 1e-3,
-              max_epochs: int = 100,
-              patience: int = 12) -> dict:
+def class_balance_info(y: np.ndarray) -> Dict[int, float]:
+    vals, cnt = np.unique(y.astype(int), return_counts=True)
+    total = cnt.sum()
+    return {int(v): float(c / total) for v, c in zip(vals, cnt)}
+
+def make_weighted_sampler(y_train: np.ndarray) -> WeightedRandomSampler:
+    vals, cnt = np.unique(y_train.astype(int), return_counts=True)
+    freq = {int(v): c for v, c in zip(vals, cnt)}
+    w = np.array([1.0 / (freq.get(int(t), 1) + 1e-8) for t in y_train.astype(int)], dtype=np.float32)
+    return WeightedRandomSampler(w, num_samples=len(w), replacement=True)
+
+def best_threshold(y_true: np.ndarray, y_prob: np.ndarray, grid=None):
+    if grid is None:
+        grid = np.linspace(0.2, 0.8, 25)
+    best_f1, best_t = -1.0, 0.5
+    for t in grid:
+        f1 = f1_score(y_true, (y_prob >= t).astype(int), average="macro", zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_t = f1, float(t)
+    return best_t, best_f1
+
+
+# =======================
+# Train one
+# =======================
+def train_one(timeframe: str, target: str, variant_id: str, features: List[str],
+              seq_len: int = 32, batch_size: int = 256, lr: float = 3e-4,
+              max_epochs: int = 100, patience: int = 12,
+              logger: Optional[logging.Logger] = None) -> dict:
     model_name = f"LSTM_{timeframe}_{target}_V{variant_id}"
-    save_path = os.path.join(MODEL_DIR, f"{model_name}.pt")
-    scaler_path = os.path.join(MODEL_DIR, f"{model_name}.scaler.pkl")
-    log_path = os.path.join(LOG_DIR, f"{model_name}_log.csv")
     base_no_ext = os.path.join(MODEL_DIR, model_name)
+    csv_log = os.path.join(LOG_DIR, f"{model_name}.csv")
 
     try:
         df = load_dataframe(timeframe, target)
-
-        # Перевірка фіч і таргета
         missing = [f for f in features if f not in df.columns]
         if missing:
             return {"model": model_name, "status": f"❌ missing features: {missing}", "val_acc": None, "val_f1": None}
 
-        target_col = f"target_{target}" if f"target_{target}" in df.columns else "target"
-        if target_col not in df.columns:
-            return {"model": model_name, "status": f"❌ missing target column: {target_col}", "val_acc": None, "val_f1": None}
+        tgt = f"target_{target}" if f"target_{target}" in df.columns else "target"
+        if tgt not in df.columns:
+            return {"model": model_name, "status": f"❌ missing target column: {tgt}", "val_acc": None, "val_f1": None}
 
+        # raw
         X_all = df[features].values.astype(np.float32)
-        y_all = df[target_col].values.astype(np.float32)
+        y_all = df[tgt].values.astype(np.float32)
 
-        # Time split
-        idx_train, idx_val = time_split_indices(len(X_all), val_ratio=0.2)
-        X_train_raw, y_train_raw = X_all[idx_train], y_all[idx_train]
-        X_val_raw,   y_val_raw   = X_all[idx_val],   y_all[idx_val]
+        # перевірка константного таргета на train/val
+        idx_tr, idx_va = time_split_indices(len(X_all), 0.2)
+        Xtr_raw, ytr_raw = X_all[idx_tr], y_all[idx_tr]
+        Xva_raw, yva_raw = X_all[idx_va], y_all[idx_va]
+        if np.unique(ytr_raw).size < 2 or np.unique(yva_raw).size < 2:
+            return {"model": model_name, "status": "❌ target is constant on train or val", "val_acc": None, "val_f1": None}
 
-        # Scale: fit тільки на train
-        scaler = fit_scale_features(X_train_raw)
-        # одразу зберігаємо специфікацію фіч/скейлера (і згодом оновимо joblib під час best-ckpt)
-        save_feature_spec(
-            base_path_no_ext=base_no_ext,
-            model_name=model_name,
-            timeframe=timeframe,
-            target=target,
-            variant_id=variant_id,
-            features=features,
-            seq_len=seq_len,
-            scaler=scaler
-        )
+        # scale & save spec/scaler
+        scaler = fit_scale_features(Xtr_raw)
+        save_feature_spec(base_no_ext, model_name, timeframe, target, variant_id, features, seq_len, scaler)
 
-        X_train = transform_features(scaler, X_train_raw)
-        X_val   = transform_features(scaler, X_val_raw)
-
-        # Послідовності
-        Xtr_seq, ytr_seq = build_sequences(X_train, y_train_raw, seq_len=seq_len)
-        Xva_seq, yva_seq = build_sequences(X_val, y_val_raw, seq_len=seq_len)
+        Xtr, Xva = transform_features(scaler, Xtr_raw), transform_features(scaler, Xva_raw)
+        Xtr_seq, ytr_seq = build_sequences(Xtr, ytr_raw, seq_len)
+        Xva_seq, yva_seq = build_sequences(Xva, yva_raw, seq_len)
 
         if len(Xtr_seq) == 0 or len(Xva_seq) == 0:
             return {"model": model_name, "status": "❌ not enough data for sequences", "val_acc": None, "val_f1": None}
 
-        # Datasets / Loaders
-        train_ds = SeqDataset(Xtr_seq, ytr_seq)
-        val_ds   = SeqDataset(Xva_seq, yva_seq)
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-        val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
+        ds_tr, ds_va = SeqDataset(Xtr_seq, ytr_seq), SeqDataset(Xva_seq, yva_seq)
 
-        # Model / loss / opt
-        model = LSTMClassifier(input_size=X_train.shape[1], hidden_size=64, num_layers=2, dropout=0.2).to(DEVICE)
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = optim.Adam(model.parameters(), lr=lr)
+        # Баланс класів: Weighted sampler + pos_weight
+        sampler = make_weighted_sampler(ytr_seq.reshape(-1))
+        dl_tr = DataLoader(ds_tr, batch_size=batch_size, sampler=sampler, drop_last=False, num_workers=2, pin_memory=True)
+        dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-        # Логи у файл
-        ensure_dirs(LOG_DIR)
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write("epoch,train_loss,val_loss,val_acc,val_f1,best_f1\n")
+        # Модель / лосс / оптимайзер / шедулер
+        model = LSTMClassifier(Xtr_seq.shape[2]).to(DEVICE)
+        frac = class_balance_info(ytr_seq.reshape(-1))
+        p = frac.get(1, 0.5)
+        pos_weight = torch.tensor([(1 - p) / (p + 1e-8)], dtype=torch.float32, device=DEVICE)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-        best_f1 = -1.0
-        best_val_loss = float("inf")
-        no_improve = 0
+        opt = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=5, T_mult=2)
 
-        for epoch in range(1, max_epochs + 1):
-            # ---- train ----
+        # CSV лог
+        os.makedirs(LOG_DIR, exist_ok=True)
+        if not os.path.exists(csv_log):
+            with open(csv_log, "w", encoding="utf-8") as f:
+                f.write("timestamp,model,epoch,phase,loss,acc,f1,lr,thr\n")
+
+        def log_row(epoch, phase, loss, acc, f1, thr):
+            with open(csv_log, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now().isoformat(timespec='seconds')},{model_name},{epoch},{phase},{loss:.6f},{acc:.6f},{f1:.6f},{opt.param_groups[0]['lr']:.6e},{thr:.4f}\n")
+
+        best_f1, best_state, no_improve, best_thr = -1.0, None, 0, 0.5
+        last_val_acc = 0.0
+
+        if logger:
+            logger.info(f"[{model_name}] start seq_len={seq_len} batch={batch_size} lr={lr} device={DEVICE.type} class_frac={frac}")
+
+        for ep in range(1, max_epochs + 1):
+            # TRAIN
             model.train()
-            train_losses = []
-            for xb, yb in train_loader:
-                xb = xb.to(DEVICE, non_blocking=True)   # (B, T, F)
-                yb = yb.to(DEVICE, non_blocking=True)   # (B, 1)
-
-                optimizer.zero_grad()
-                logits = model(xb)
+            tr_losses, tr_pred, tr_true = [], [], []
+            for xb, yb in dl_tr:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE).view(-1)
+                opt.zero_grad(set_to_none=True)
+                logits = model(xb)  # [B]
                 loss = criterion(logits, yb)
-                if torch.isnan(loss) or torch.isinf(loss):
-                    return {"model": model_name, "status": "❌ loss NaN/Inf", "val_acc": None, "val_f1": None}
-
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                train_losses.append(loss.item())
+                clip_grad_norm_(model.parameters(), max_norm=1.0)
+                opt.step()
+                tr_losses.append(float(loss.item()))
+                probs = torch.sigmoid(logits).detach().cpu().numpy()
+                tr_pred.append((probs >= 0.5).astype(int))
+                tr_true.append(yb.detach().cpu().numpy().astype(int))
+            sched.step(ep)
 
-            train_loss = float(np.mean(train_losses)) if train_losses else np.nan
+            if tr_true:
+                tr_pred = np.concatenate(tr_pred); tr_true = np.concatenate(tr_true)
+                tr_acc = accuracy_score(tr_true, tr_pred)
+                tr_f1  = f1_score(tr_true, tr_pred, average="macro", zero_division=0)
+            else:
+                tr_acc = tr_f1 = 0.0
+            tr_loss = float(np.mean(tr_losses)) if tr_losses else float("nan")
+            log_row(ep, "train", tr_loss, tr_acc, tr_f1, 0.5)
+            if logger:
+                logger.info(f"[{model_name}] epoch {ep:02d} train loss={tr_loss:.4f} acc={tr_acc:.4f} f1={tr_f1:.4f}")
 
-            # ---- validate ----
+            # VAL
             model.eval()
-            val_losses = []
-            all_true, all_pred = [], []
+            va_losses, va_probs, va_true = [], [], []
             with torch.no_grad():
-                for xb, yb in val_loader:
-                    xb = xb.to(DEVICE, non_blocking=True)
-                    yb = yb.to(DEVICE, non_blocking=True)
+                for xb, yb in dl_va:
+                    xb, yb = xb.to(DEVICE), yb.to(DEVICE).view(-1)
                     logits = model(xb)
-                    loss = criterion(logits, yb)
-                    val_losses.append(loss.item())
-                    probs = torch.sigmoid(logits)
-                    preds = (probs > 0.5).float()
-                    all_true.append(yb.detach().cpu().numpy())
-                    all_pred.append(preds.detach().cpu().numpy())
+                    va_losses.append(float(criterion(logits, yb).item()))
+                    va_probs.append(torch.sigmoid(logits).detach().cpu().numpy())
+                    va_true.append(yb.detach().cpu().numpy().astype(int))
+            va_loss = float(np.mean(va_losses)) if va_losses else float("nan")
+            if va_true:
+                va_probs = np.concatenate(va_probs); va_true = np.concatenate(va_true)
+                thr, va_f1 = best_threshold(va_true, va_probs)
+                va_pred = (va_probs >= thr).astype(int)
+                va_acc = accuracy_score(va_true, va_pred)
+            else:
+                thr, va_f1, va_acc = 0.5, 0.0, 0.0
 
-            val_loss = float(np.mean(val_losses)) if val_losses else np.nan
-            y_true = np.vstack(all_true)
-            y_pred = np.vstack(all_pred)
-            val_acc = accuracy_score(y_true, y_pred)
-            val_f1  = f1_score(y_true, y_pred, zero_division=0)
+            log_row(ep, "val", va_loss, va_acc, va_f1, thr)
+            if logger:
+                logger.info(f"[{model_name}] epoch {ep:02d} val   loss={va_loss:.4f} acc={va_acc:.4f} f1={va_f1:.4f} thr={thr:.3f}")
 
-            # ---- запис у файл
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{val_acc:.6f},{val_f1:.6f},{max(best_f1,val_f1):.6f}\n")
-
-            # ---- ПРИНТ у консоль
-            print(f"[{model_name}] epoch {epoch}: "
-                  f"train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, "
-                  f"val_acc={val_acc:.6f}, val_f1={val_f1:.6f}")
-
-            # ---- early stopping by best F1 (tie-break: lower val_loss)
-            improved = (val_f1 > best_f1 + 1e-6) or (abs(val_f1 - best_f1) <= 1e-6 and val_loss < best_val_loss - 1e-6)
-            if improved:
-                best_f1 = val_f1
-                best_val_loss = val_loss
-                ensure_dirs(MODEL_DIR)
-                torch.save(model.state_dict(), save_path)
-                joblib.dump(scaler, scaler_path)
-                no_improve = 0
+            # Early stopping по macro-F1
+            if va_f1 > best_f1 + 1e-4:
+                best_f1, best_thr, best_state, no_improve = va_f1, thr, model.state_dict(), 0
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(f"[{model_name}] ⏹️ early stop at epoch {epoch} (best_f1={best_f1:.4f})")
+                    if logger:
+                        logger.info(f"[{model_name}] early stop at {ep} (best_f1={best_f1:.4f} thr={best_thr:.3f})")
                     break
 
-        # ---- final eval on val with best ----
-        if os.path.exists(save_path):
-            model.load_state_dict(torch.load(save_path, map_location=DEVICE))
-        model.eval()
-        with torch.no_grad():
-            logits_all, y_all = [], []
-            for xb, yb in val_loader:
-                xb = xb.to(DEVICE)
-                logits_all.append(model(xb).cpu())
-                y_all.append(yb)
-            logits_all = torch.cat(logits_all, dim=0)
-            y_all = torch.cat(y_all, dim=0)
-            probs = torch.sigmoid(logits_all)
-            preds = (probs > 0.5).float().numpy()
-            final_acc = accuracy_score(y_all.numpy(), preds)
-            final_f1  = f1_score(y_all.numpy(), preds, zero_division=0)
+            last_val_acc = va_acc
 
-        return {"model": model_name, "status": "✅ trained", "val_acc": final_acc, "val_f1": final_f1}
+        if best_state is None:
+            best_state = model.state_dict()
+
+        # Save best
+        torch.save({"state_dict": best_state, "best_val_f1": best_f1, "best_thr": best_thr}, base_no_ext + ".pt")
+        if logger:
+            logger.info(f"[{model_name}] saved {base_no_ext+'.pt'}")
+        return {"model": model_name, "status": "✅ trained", "val_acc": last_val_acc, "val_f1": best_f1}
 
     except Exception as e:
-        return {"model": model_name, "status": f"❌ error: {type(e).__name__}: {str(e)}", "val_acc": None, "val_f1": None}
+        if logger:
+            logger.exception(f"[{model_name}] crash: {e}")
+        return {"model": model_name, "status": f"❌ error: {type(e).__name__}: {e}", "val_acc": None, "val_f1": None}
 
 
+# =======================
+# Main
+# =======================
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol", default="BTCUSDT", help="Ticker symbol, e.g. ETHUSDT. Default: BTCUSDT.")
-    parser.add_argument("--data-root", default="test/data", help="Root folder with per-symbol subfolders.")
-    parser.add_argument("--models-dir", default=None, help="Override models dir (default by symbol).")
-    parser.add_argument("--logs-dir", default=None, help="Override logs dir (default by symbol).")
-    parser.add_argument("--device", default=None, choices=["cpu", "cuda"], help="Force device (optional).")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbol", default="BTCUSDT")
+    ap.add_argument("--data-root", default="test/data")
+    ap.add_argument("--models-dir", default=None)
+    ap.add_argument("--logs-dir", default=None)
+    ap.add_argument("--device", default=None, choices=["cpu", "cuda"])
+    ap.add_argument("--seq_len", type=int, default=32)
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--patience", type=int, default=12)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--batch_size", type=int, default=256)
+    args = ap.parse_args()
 
-    parser.add_argument("--seq_len", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=12)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--batch_size", type=int, default=256)
-    args = parser.parse_args()
+    # dirs
+    data_dir, models_dir, logs_dir = compute_paths(
+        args.symbol, data_root=args.data_root, models_dir=args.models_dir, logs_dir=args.logs_dir
+    )
 
-    # compute dirs for symbol
-    data_dir, models_dir, logs_dir = compute_paths(args.symbol, data_root=args.data_root,
-                                                   models_dir=args.models_dir, logs_dir=args.logs_dir)
-
-    # set globals used by helpers/trainers
+    # globals
     global SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, RESULTS_CSV, FEATURES_MANIFEST, DEVICE
     SYMBOL = args.symbol.upper()
     DATA_DIR = data_dir
@@ -443,23 +455,39 @@ def main():
         DEVICE = torch.device(args.device)
 
     ensure_dirs(MODEL_DIR, LOG_DIR)
+    logger = setup_single_file_logger(LOG_DIR)
 
     print(f"🧩 Settings: symbol={SYMBOL} | data_dir={DATA_DIR} | models_dir={MODEL_DIR} | logs_dir={LOG_DIR} | device={DEVICE.type}")
+    logger.info(f"start symbol={SYMBOL} data={DATA_DIR} models={MODEL_DIR} logs={LOG_DIR} device={DEVICE.type}")
 
     results = []
+    # Коректний total для прогресбару
     total = len(TIMEFRAMES) * len(TARGETS) * len(VARIANT_FEATURE_SETS)
-    desc = f"🧠 Training LSTM models on {DEVICE.type}"
 
-    with tqdm(total=total, desc=desc) as pbar:
+    with tqdm(total=total, desc=f"🧠 Training LSTM models on {DEVICE.type}") as pbar:
+        seen = set()  # підстрахуємося від випадкових дублів у конфігах
         for timeframe in TIMEFRAMES:
             for target in TARGETS:
                 for variant_id, features in VARIANT_FEATURE_SETS.items():
-                    model_name = f"LSTM_{timeframe}_{target}_V{variant_id}"
-                    best_ckpt = os.path.join(MODEL_DIR, model_name + ".pt")
+                    key = (timeframe, target, str(variant_id))
+                    if key in seen:
+                        msg = f"LSTM_{timeframe}_{target}_V{variant_id}: ⏭️ duplicate combo — skipped"
+                        print(msg); logger.info(msg)
+                        pbar.update(1)
+                        continue
+                    seen.add(key)
 
-                    # Пропуск готових моделей
-                    if os.path.exists(best_ckpt):
-                        print(f"{model_name}: ⏭️ already exists — skipped")
+                    model_name = f"LSTM_{timeframe}_{target}_V{variant_id}"
+                    base_no_ext = os.path.join(MODEL_DIR, model_name)
+                    pt = base_no_ext + ".pt"
+                    sc = base_no_ext + ".scaler.npz"
+                    sp = base_no_ext + ".spec.json"
+
+                    # Пропуск уже навчених (усі артефакти мають існувати)
+                    if os.path.exists(pt) and os.path.exists(sc) and os.path.exists(sp):
+                        msg = f"{model_name}: ⏭️ already exists — skipped"
+                        print(msg)
+                        logger.info(msg)
                         pbar.update(1)
                         continue
 
@@ -473,17 +501,24 @@ def main():
                         lr=args.lr,
                         max_epochs=args.epochs,
                         patience=args.patience,
+                        logger=logger,
                     )
-                    print(f"{res['model']}: {res['status']} | acc={res['val_acc']}, f1={res['val_f1']}")
+                    msg = f"{res['model']}: {res['status']} | acc={res['val_acc']}, f1={res['val_f1']}"
+                    print(msg)
+                    logger.info(msg)
                     results.append(res)
                     pbar.update(1)
 
     if results:
         pd.DataFrame(results).to_csv(RESULTS_CSV, index=False)
         print(f"📊 Results saved to {RESULTS_CSV}")
+        logger.info(f"results {RESULTS_CSV}")
     else:
         print("✅ All models already trained — nothing to do.")
+        logger.info("all models already trained — nothing to do.")
+
     print(f"🧾 Features manifest: {FEATURES_MANIFEST}")
+    logger.info(f"manifest {FEATURES_MANIFEST}")
 
 
 if __name__ == "__main__":

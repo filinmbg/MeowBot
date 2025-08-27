@@ -8,6 +8,9 @@ import argparse
 import warnings
 from typing import List, Tuple
 
+import logging
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -20,19 +23,23 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score
 
-# ---- robust import of configs (works with -m) -------------------------------
-try:
-    from .configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
-except Exception:
-    try:
-        from test.Models.configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
-    except Exception:
-        from configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
+import importlib.util, pathlib
+
+_THIS = pathlib.Path(__file__).resolve()
+_CFG  = _THIS.parent / "configs.py"
+
+spec = importlib.util.spec_from_file_location("model_configs", _CFG)
+_cfg = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(_cfg)
+
+TIMEFRAMES = _cfg.TIMEFRAMES
+TARGETS = _cfg.TARGETS
+VARIANT_FEATURE_SETS = _cfg.VARIANT_FEATURE_SETS
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # =======================
-# Globals (overridden by --symbol in main)
+# Globals (some defaults get overridden in main)
 # =======================
 SYMBOL = "BTCUSDT"
 MODEL_DIR = "models/DQN"
@@ -40,13 +47,10 @@ LOG_DIR = "logs/DQN"
 DATA_DIR = os.path.join("test", "data", SYMBOL)
 RESULTS_CSV = os.path.join(MODEL_DIR, "dqn_training_results.csv")
 FEATURES_MANIFEST = os.path.join(MODEL_DIR, "features_manifest.csv")
-
 SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # =======================
@@ -61,26 +65,45 @@ def compute_paths(symbol: str,
                   models_dir: str | None = None,
                   logs_dir: str | None = None) -> tuple[str, str, str]:
     """
-    Returns (data_dir, models_dir, logs_dir) based on symbol.
-    - For BTCUSDT keep legacy: models/DQN, logs/DQN
-    - For others: models/DQN_<SYMBOL>, logs/DQN_<SYMBOL>
+    Повертає (data_dir, models_dir, logs_dir) у форматі:
+      - models/<SYMBOL>/DQN
+      - logs/<SYMBOL>/DQN
+    Якщо передано власні --models-dir / --logs-dir — використовуємо їх як є.
     """
     symbol = symbol.upper()
     data_dir = os.path.join(data_root, symbol)
-    default_models = "models/DQN" if symbol == "BTCUSDT" else f"models/DQN_{symbol}"
-    default_logs   = "logs/DQN"   if symbol == "BTCUSDT" else f"logs/DQN_{symbol}"
-    models_dir = models_dir or default_models
-    logs_dir   = logs_dir or default_logs
+
+    def _norm(p: str | None) -> str:
+        return (p or "").replace("\\", "/").rstrip("/").lower()
+
+    if models_dir is None or _norm(models_dir) == "models/dqn":
+        models_dir = os.path.join("models", symbol, "DQN")
+    if logs_dir is None or _norm(logs_dir) == "logs/dqn":
+        logs_dir = os.path.join("logs", symbol, "DQN")
+
     return data_dir, models_dir, logs_dir
+
+def setup_single_file_logger(log_dir: str) -> logging.Logger:
+    ensure_dirs(log_dir)
+    logger = logging.getLogger(f"dqn_train_{int(datetime.now().timestamp())}")
+    logger.setLevel(logging.INFO)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fh = logging.FileHandler(os.path.join(log_dir, f"train_{ts}.log"), encoding="utf-8")
+    ch = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    fh.setFormatter(fmt); ch.setFormatter(fmt)
+    logger.addHandler(fh); logger.addHandler(ch)
+    logger.propagate = False
+    return logger
 
 # =======================
 # Data utils
 # =======================
 def load_dataframe(timeframe: str, target: str) -> pd.DataFrame:
-    csv_path = os.path.join(DATA_DIR, f"{SYMBOL}_{timeframe}_critical_indicators_with_targets_{target}.csv")
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(csv_path)
-    df = pd.read_csv(csv_path)
+    path = os.path.join(DATA_DIR, f"{SYMBOL}_{timeframe}_critical_indicators_with_targets_{target}.csv")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    df = pd.read_csv(path)
     for col in ["timestamp", "time", "open_time", "date"]:
         if col in df.columns:
             df = df.sort_values(col).reset_index(drop=True)
@@ -103,75 +126,67 @@ def transform_features(scaler: StandardScaler, X: np.ndarray) -> np.ndarray:
 def build_sequences(X: np.ndarray, y: np.ndarray, seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
     n = len(X)
     if n < seq_len:
-        return np.empty((0, seq_len, X.shape[1]), dtype=np.float32), np.empty((0, 1), dtype=np.float32)
-    X_seq, y_seq = [], []
+        return np.empty((0, seq_len, X.shape[1]), np.float32), np.empty((0, 1), np.float32)
+    Xs, ys = [], []
     for t in range(seq_len - 1, n):
-        X_seq.append(X[t - seq_len + 1:t + 1])
-        y_seq.append([y[t]])
-    X_seq = np.array(X_seq, dtype=np.float32)
-    y_seq = np.array(y_seq, dtype=np.float32)
-    return X_seq, y_seq
+        Xs.append(X[t - seq_len + 1:t + 1])
+        ys.append([y[t]])
+    return np.asarray(Xs, np.float32), np.asarray(ys, np.float32)
 
+# =======================
+# Model
+# =======================
 class SeqDataset(Dataset):
-    def __init__(self, X_seq: np.ndarray, y_seq: np.ndarray):
-        self.X = X_seq
-        self.y = y_seq
-    def __len__(self): return len(self.X)
-    def __getitem__(self, idx):
-        return torch.tensor(self.X[idx], dtype=torch.float32), torch.tensor(self.y[idx], dtype=torch.float32)
+    def __init__(self, X, y):
+        self.X, self.y = X, y
+    def __len__(self):
+        return len(self.X)
+    def __getitem__(self, i):
+        return torch.tensor(self.X[i], dtype=torch.float32), torch.tensor(self.y[i], dtype=torch.float32)
 
 class DQNClassifier(nn.Module):
-    """
-    Проста «DQN-подібна» класифікація: flatten(T,F) → MLP → логіт (binary).
-    """
     def __init__(self, input_size: int, hidden: int = 256, dropout: float = 0.2):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_size, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
+            nn.Linear(input_size, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden, 1)
         )
-    def forward(self, x):  # x: (B, T, F)
+    def forward(self, x):
         b = x.shape[0]
-        x = x.reshape(b, -1)
-        return self.net(x)
+        return self.net(x.reshape(b, -1))
 
-def save_feature_spec(base_path_no_ext: str,
-                      model_name: str,
-                      timeframe: str,
-                      target: str,
-                      variant_id: str,
-                      features: List[str],
-                      seq_len: int,
-                      scaler: StandardScaler):
+# =======================
+# Saving feature spec / scaler
+# =======================
+def save_feature_spec(base_no_ext: str, model_name: str, timeframe: str, target: str,
+                      variant_id: str, features: List[str], seq_len: int, scaler: StandardScaler):
     spec = {
         "model_name": model_name,
-        "symbol": SYMBOL,
-        "timeframe": timeframe,
-        "target": target,
-        "variant_id": str(variant_id),
-        "seq_len": int(seq_len),
-        "features": list(features),
-        "n_features": int(len(features)),
-        "preprocessing": {"scaler": "StandardScaler", "with_mean": True, "with_std": True},
+        "symbol":      SYMBOL,
+        "timeframe":   timeframe,
+        "target":      target,
+        "variant_id":  str(variant_id),
+        "seq_len":     int(seq_len),
+        "features":    list(features),
+        "n_features":  int(len(features)),
+        "preprocessing": {
+            "scaler": "StandardScaler",
+            "with_mean": True,
+            "with_std":  True
+        },
         "seed": int(SEED)
     }
-    with open(base_path_no_ext + ".features.json", "w", encoding="utf-8") as f:
+    with open(base_no_ext + ".features.json", "w", encoding="utf-8") as f:
         json.dump(spec, f, ensure_ascii=False, indent=2)
 
-    mean_ = getattr(scaler, "mean_", None)
-    scale_ = getattr(scaler, "scale_", None)
-    var_   = getattr(scaler, "var_", None)
+    mean_, scale_, var_ = getattr(scaler, "mean_", None), getattr(scaler, "scale_", None), getattr(scaler, "var_", None)
     if mean_ is not None and scale_ is not None:
         np.savez_compressed(
-            base_path_no_ext + ".scaler.npz",
-            mean_=np.asarray(mean_, dtype=np.float32),
-            scale_=np.asarray(scale_, dtype=np.float32),
-            var_=np.asarray(var_ if var_ is not None else np.square(scale_), dtype=np.float32)
+            base_no_ext + ".scaler.npz",
+            mean_=np.asarray(mean_, np.float32),
+            scale_=np.asarray(scale_, np.float32),
+            var_=np.asarray(var_ if var_ is not None else np.square(scale_), np.float32)
         )
 
     row = {
@@ -192,164 +207,89 @@ def save_feature_spec(base_path_no_ext: str,
     dfm.to_csv(FEATURES_MANIFEST, index=False)
 
 # =======================
-# Train one model
+# Train one
 # =======================
-def train_one(timeframe: str,
-              target: str,
-              variant_id: str,
-              features: List[str],
-              seq_len: int = 32,
-              batch_size: int = 256,
-              lr: float = 1e-3,
-              max_epochs: int = 100,
-              patience: int = 12) -> dict:
+def train_one(timeframe: str, target: str, variant_id: str, features: List[str],
+              seq_len: int = 32, batch_size: int = 256, lr: float = 1e-3,
+              max_epochs: int = 100, patience: int = 12) -> dict:
     model_name = f"DQN_{timeframe}_{target}_V{variant_id}"
-    save_path = os.path.join(MODEL_DIR, f"{model_name}.pt")
-    scaler_path = os.path.join(MODEL_DIR, f"{model_name}.scaler.pkl")
-    log_path = os.path.join(LOG_DIR, f"{model_name}_log.csv")
     base_no_ext = os.path.join(MODEL_DIR, model_name)
-
     try:
         df = load_dataframe(timeframe, target)
-
-        # Перевірка фіч і таргета
         missing = [f for f in features if f not in df.columns]
         if missing:
             return {"model": model_name, "status": f"❌ missing features: {missing}", "val_acc": None, "val_f1": None}
-
-        target_col = f"target_{target}" if f"target_{target}" in df.columns else "target"
-        if target_col not in df.columns:
-            return {"model": model_name, "status": f"❌ missing target column: {target_col}", "val_acc": None, "val_f1": None}
+        tgt = f"target_{target}" if f"target_{target}" in df.columns else "target"
+        if tgt not in df.columns:
+            return {"model": model_name, "status": f"❌ missing target column: {tgt}", "val_acc": None, "val_f1": None}
 
         X_all = df[features].values.astype(np.float32)
-        y_all = df[target_col].values.astype(np.float32)
+        y_all = df[tgt].values.astype(np.float32)
 
-        # Time split
-        idx_train, idx_val = time_split_indices(len(X_all), val_ratio=0.2)
-        X_train_raw, y_train_raw = X_all[idx_train], y_all[idx_train]
-        X_val_raw,   y_val_raw   = X_all[idx_val],   y_all[idx_val]
+        idx_tr, idx_va = time_split_indices(len(X_all), 0.2)
+        Xtr_raw, ytr_raw = X_all[idx_tr], y_all[idx_tr]
+        Xva_raw, yva_raw = X_all[idx_va], y_all[idx_va]
 
-        # Scale (fit тільки на train)
-        scaler = fit_scale_features(X_train_raw)
-        save_feature_spec(
-            base_path_no_ext=base_no_ext,
-            model_name=model_name,
-            timeframe=timeframe,
-            target=target,
-            variant_id=variant_id,
-            features=features,
-            seq_len=seq_len,
-            scaler=scaler
-        )
+        scaler = fit_scale_features(Xtr_raw)
+        save_feature_spec(base_no_ext, model_name, timeframe, target, variant_id, features, seq_len, scaler)
 
-        X_train = transform_features(scaler, X_train_raw)
-        X_val   = transform_features(scaler, X_val_raw)
-
-        # Послідовності
-        Xtr_seq, ytr_seq = build_sequences(X_train, y_train_raw, seq_len=seq_len)
-        Xva_seq, yva_seq = build_sequences(X_val,   y_val_raw,   seq_len=seq_len)
+        Xtr, Xva = transform_features(scaler, Xtr_raw), transform_features(scaler, Xva_raw)
+        Xtr_seq, ytr_seq = build_sequences(Xtr, ytr_raw, seq_len)
+        Xva_seq, yva_seq = build_sequences(Xva, yva_raw, seq_len)
         if len(Xtr_seq) == 0 or len(Xva_seq) == 0:
             return {"model": model_name, "status": "❌ not enough data for sequences", "val_acc": None, "val_f1": None}
 
-        # Datasets / Loaders
-        train_loader = DataLoader(SeqDataset(Xtr_seq, ytr_seq), batch_size=batch_size, shuffle=True, drop_last=False)
-        val_loader   = DataLoader(SeqDataset(Xva_seq, yva_seq), batch_size=batch_size, shuffle=False, drop_last=False)
+        ds_tr, ds_va = SeqDataset(Xtr_seq, ytr_seq), SeqDataset(Xva_seq, yva_seq)
+        dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True)
+        dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False)
 
-        # Model / loss / opt
-        input_size = Xtr_seq.shape[1] * Xtr_seq.shape[2]  # T*F
-        model = DQNClassifier(input_size=input_size, hidden=256, dropout=0.2).to(DEVICE)
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = optim.Adam(model.parameters(), lr=lr)
+        model = DQNClassifier(input_size=Xtr_seq.shape[1] * Xtr_seq.shape[2]).to(DEVICE)
+        opt = optim.AdamW(model.parameters(), lr=lr)
+        bce = nn.BCEWithLogitsLoss()
 
-        # Лог-файл
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write("epoch,train_loss,val_loss,val_acc,val_f1,best_f1\n")
-
-        best_f1 = -1.0
-        best_val_loss = float("inf")
-        no_improve = 0
-
-        for epoch in range(1, max_epochs + 1):
-            # ---- train ----
+        best_f1, best_state, no_improve = -1.0, None, 0
+        for ep in range(1, max_epochs + 1):
             model.train()
-            train_losses = []
-            for xb, yb in train_loader:
-                xb = xb.to(DEVICE, non_blocking=True)   # (B, T, F)
-                yb = yb.to(DEVICE, non_blocking=True)   # (B, 1)
-
-                optimizer.zero_grad()
-                logits = model(xb)                      # (B, 1)
-                loss = criterion(logits, yb)
-                if torch.isnan(loss) or torch.isinf(loss):
-                    return {"model": model_name, "status": "❌ loss NaN/Inf", "val_acc": None, "val_f1": None}
-
+            losses = []
+            for xb, yb in dl_tr:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                opt.zero_grad(set_to_none=True)
+                loss = bce(model(xb).view(-1), yb.view(-1))
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                train_losses.append(loss.item())
+                opt.step()
+                losses.append(float(loss.item()))
 
-            train_loss = float(np.mean(train_losses)) if train_losses else np.nan
-
-            # ---- validate ----
             model.eval()
-            val_losses = []
-            all_true, all_pred = [], []
+            preds, true = [], []
             with torch.no_grad():
-                for xb, yb in val_loader:
-                    xb = xb.to(DEVICE, non_blocking=True)
-                    yb = yb.to(DEVICE, non_blocking=True)
-                    logits = model(xb)
-                    loss = criterion(logits, yb)
-                    val_losses.append(loss.item())
-                    probs = torch.sigmoid(logits)
-                    preds = (probs > 0.5).float()
-                    all_true.append(yb.detach().cpu().numpy())
-                    all_pred.append(preds.detach().cpu().numpy())
+                for xb, yb in dl_va:
+                    pr = (torch.sigmoid(model(xb.to(DEVICE)).view(-1)) > 0.5).long().cpu().numpy()
+                    preds.append(pr)
+                    true.append(yb.view(-1).cpu().numpy().astype(int))
+            preds = np.concatenate(preds) if preds else np.array([])
+            true = np.concatenate(true) if true else np.array([])
+            acc = accuracy_score(true, preds) if true.size else 0.0
+            f1 = f1_score(true, preds, zero_division=0) if true.size else 0.0
+            avg = float(np.mean(losses)) if losses else float("nan")
+            tqdm.write(f"   [epoch {ep:02d}] loss={avg:.4f} | acc={acc:.4f} | f1={f1:.4f}")
 
-            val_loss = float(np.mean(val_losses)) if val_losses else np.nan
-            y_true = np.vstack(all_true)
-            y_pred = np.vstack(all_pred)
-            val_acc = accuracy_score(y_true, y_pred)
-            val_f1  = f1_score(y_true, y_pred, zero_division=0)
-
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{val_acc:.6f},{val_f1:.6f},{max(best_f1,val_f1):.6f}\n")
-
-            improved = (val_f1 > best_f1 + 1e-6) or (abs(val_f1 - best_f1) <= 1e-6 and val_loss < best_val_loss - 1e-6)
-            if improved:
-                best_f1 = val_f1
-                best_val_loss = val_loss
-                ensure_dirs(MODEL_DIR)
-                torch.save(model.state_dict(), save_path)
-                no_improve = 0
+            if f1 > best_f1 + 1e-6:
+                best_f1, best_state, no_improve = f1, model.state_dict(), 0
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    print(f"[{model_name}] ⏹️ early stop at epoch {epoch} (best_f1={best_f1:.4f})")
                     break
 
-        # final eval
-        if os.path.exists(save_path):
-            model.load_state_dict(torch.load(save_path, map_location=DEVICE))
-        model.eval()
-        with torch.no_grad():
-            logits_all, y_all = [], []
-            for xb, yb in val_loader:
-                xb = xb.to(DEVICE)
-                logits_all.append(model(xb).cpu())
-                y_all.append(yb)
-            logits_all = torch.cat(logits_all, dim=0)
-            y_all = torch.cat(y_all, dim=0)
-            probs = torch.sigmoid(logits_all)
-            preds = (probs > 0.5).float().numpy()
-            final_acc = accuracy_score(y_all.numpy(), preds)
-            final_f1  = f1_score(y_all.numpy(), preds, zero_division=0)
-
-        return {"model": model_name, "status": "✅ trained", "val_acc": final_acc, "val_f1": final_f1}
-
+        if best_state is None:
+            best_state = model.state_dict()
+        torch.save({"state_dict": best_state}, base_no_ext + ".pt")
+        return {"model": model_name, "status": "✅ trained", "val_acc": acc, "val_f1": best_f1}
     except Exception as e:
-        return {"model": model_name, "status": f"❌ error: {type(e).__name__}: {str(e)}", "val_acc": None, "val_f1": None}
+        return {"model": model_name, "status": f"❌ error: {type(e).__name__}: {e}", "val_acc": None, "val_f1": None}
 
+# =======================
+# Main
+# =======================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", default="BTCUSDT", help="Ticker symbol, e.g. ETHUSDT. Default: BTCUSDT.")
@@ -381,7 +321,11 @@ def main():
 
     ensure_dirs(MODEL_DIR, LOG_DIR)
 
+    logger = setup_single_file_logger(LOG_DIR)
+
     print(f"🧩 Settings: symbol={SYMBOL} | data_dir={DATA_DIR} | models_dir={MODEL_DIR} | logs_dir={LOG_DIR} | device={DEVICE.type}")
+
+    logger.info(f"start symbol={SYMBOL} data={DATA_DIR} models={MODEL_DIR} logs={LOG_DIR} device={DEVICE.type}")
 
     results = []
     total = len(TIMEFRAMES) * len(TARGETS) * len(VARIANT_FEATURE_SETS)
@@ -393,7 +337,9 @@ def main():
                     best_ckpt = os.path.join(MODEL_DIR, model_name + ".pt")
 
                     if os.path.exists(best_ckpt):
-                        print(f"{model_name}: ⏭️ already exists — skipped")
+                        msg = f"{model_name}: ⏭️ already exists — skipped"
+                        print(msg)
+                        logger.info(msg)
                         pbar.update(1)
                         continue
 
@@ -408,17 +354,22 @@ def main():
                         max_epochs=args.epochs,
                         patience=args.patience,
                     )
-                    print(f"{res['model']}: {res['status']} | acc={res['val_acc']}, f1={res['val_f1']}")
+                    msg = f"{res['model']}: {res['status']} | acc={res['val_acc']}, f1={res['val_f1']}"
+                    print(msg)
+                    logger.info(msg)
                     results.append(res)
                     pbar.update(1)
 
     if results:
         pd.DataFrame(results).to_csv(RESULTS_CSV, index=False)
         print(f"📊 Results saved to {RESULTS_CSV}")
+        logger.info(f"results {RESULTS_CSV}")
     else:
         print("✅ All models already trained — nothing to do.")
+        logger.info("all models already trained — nothing to do.")
 
     print(f"🧾 Features manifest: {FEATURES_MANIFEST}")
+    logger.info(f"manifest {FEATURES_MANIFEST}")
 
 if __name__ == "__main__":
     main()

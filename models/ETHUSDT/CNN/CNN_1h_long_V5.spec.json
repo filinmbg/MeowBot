@@ -1,0 +1,13 @@
+{
+  "features": [
+    "macd",
+    "ema_20",
+    "rsi_14"
+  ],
+  "lookback": 64,
+  "target_col": "target_long",
+  "in_channels": 3,
+  "created": "2025-08-15T14:25:35.399218Z",
+  "model_file": "CNN_1h_long_V5.pt",
+  "scaler_file": "CNN_1h_long_V5.scaler.npz"
+}

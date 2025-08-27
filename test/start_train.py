@@ -4,11 +4,12 @@
 # + Прискорене завантаження: requests.Session з пулом з'єднань, швидкий gzip-запис, регульований throttle
 # + Скіп етапів за наявністю вихідних файлів (з прапорцями --force-*)
 # + NEW: у stage_train моделі, що краще працюють на GPU, запускаються з CUDA (авто/за прапорцем)
+# + NEW2: TIMEFRAMES/TARGETS/VERSIONS підтягуємо з test/Models/PPO/configs.py
 
 import sys, os, importlib, importlib.util, subprocess, gzip, time, argparse, asyncio, threading, inspect
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -24,104 +25,76 @@ for p in {str(ROOT), str(THIS.parent)}:   # додаємо і корінь, і �
 # ── Надійне підвантаження get_klines з різних місць + швидкий HTTP-fallback ─
 def resolve_get_klines():
     """
-    Повертає async-функцію get_klines(symbol, interval, start_time=None, end_time=None, limit=500)
-    1) Імпорт із binance_conn / binance_connector.binance_conn / локальних файлів
-       (ігноруємо модулі, що не вантажаться через відсутні залежності — продовжуємо пошук)
-    2) Якщо нічого не знайшли — HTTP-fallback на https://api.binance.com/api/v3/klines з requests.Session
-    """
+    Повертає async-функцію get_klines(...) **суто** з binance_conn.*.
+    Жодних лімітів/затримок тут НЕМАЄ. Жодного HTTP-fallback немає.
 
-    # 1) Стандартні імпорти з модулів
-    try:
-        from binance_conn import get_klines as gk
-        return gk
-    except Exception:
-        pass
+    Всі обмеження (limit, retry, anti-429 тощо) повинні бути реалізовані
+    тільки в binance_conn.py.
+    """
+    import asyncio
+    import importlib.util
+    import inspect
+    from pathlib import Path
+
+    ROOT = Path(__file__).resolve().parent
+    THIS = Path(__file__).resolve()
+
+    # 1) Спробувати стандартні імпорти модулів
     try:
         from binance_connector.binance_conn import get_klines as gk
-        return gk
+        target = gk
     except Exception:
-        pass
+        target = None
 
-    # 2) Пошук локальних файлів і толерантне завантаження
-    candidates = [
-        ROOT / "binance_conn.py",
-        ROOT / "binance_connector" / "binance_conn.py",
-        THIS.parent / "binance_conn.py",
-        THIS.parent / "binance_connector" / "binance_conn.py",
-    ]
-    for path in candidates:
-        if path.exists():
-            try:
-                spec = importlib.util.spec_from_file_location("binance_conn_dynamic", path)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)  # може кинути, напр., ModuleNotFoundError: dotenv
-                if hasattr(mod, "get_klines"):
-                    return mod.get_klines
-            except Exception:
-                # якщо модуль не імпортується через залежності — пропускаємо і йдемо далі
-                continue
+    if target is None:
+        try:
+            from binance_connector.binance_conn import get_klines as gk
+            target = gk
+        except Exception:
+            target = None
 
-    # 3) HTTP-fallback: швидка сесія з пулом з'єднань
-    import asyncio
-    try:
-        import requests
-    except Exception as e:
-        raise ModuleNotFoundError(
-            "Не знайдено 'get_klines' у локальних модулях і відсутній 'requests' для HTTP-fallback. "
-            "Встанови: pip install requests"
-        ) from e
+    # 2) Якщо не знайшли — спробувати завантажити з локальних файлів
+    if target is None:
+        candidates = [
+            ROOT / "binance_conn.py",
+            ROOT / "binance_connector" / "binance_conn.py",
+            THIS.parent / "binance_conn.py",
+            THIS.parent / "binance_connector" / "binance_conn.py",
+        ]
+        for path in candidates:
+            if path.exists():
+                try:
+                    spec = importlib.util.spec_from_file_location("binance_conn_dynamic", path)
+                    mod = importlib.util.module_from_spec(spec)
+                    assert spec.loader is not None
+                    spec.loader.exec_module(mod)  # може кинути через відсутні залежності — ігноруємо
+                    if hasattr(mod, "get_klines"):
+                        target = getattr(mod, "get_klines")
+                        break
+                except Exception:
+                    continue  # толерантно пропускаємо і йдемо далі
 
-    _session = requests.Session()
-    _adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=3)
-    _session.mount("https://", _adapter)
-    _session.headers.update({"Accept-Encoding": "gzip, deflate", "Connection": "keep-alive"})
+    # 3) Якщо так і не знайшли — фейлимося явно
+    if target is None or not callable(target):
+        raise ImportError(
+            "Не знайдено функцію 'get_klines' у binance_conn.py. "
+            "Переконайся, що binance_conn.py присутній і експортує get_klines."
+        )
 
-    def _to_ms(t):
-        if t is None:
-            return None
-        if isinstance(t, (int, float)):
-            return int(t if t > 1_000_000_000_000 else t * 1000)
-        if isinstance(t, str):
-            s = t.strip()
-            try:
-                v = float(s)
-                return int(v if v > 1_000_000_000_000 else v * 1000)
-            except ValueError:
-                pass
-            try:
-                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except Exception:
-                dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp() * 1000)
-        if hasattr(t, "timestamp"):
-            dt = t
-            if getattr(dt, "tzinfo", None) is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp() * 1000)
-        raise TypeError(f"Unsupported time type for start/end: {type(t)}")
+    # 4) Гарантуємо async-інтерфейс без жодних обмежень тут
+    if inspect.iscoroutinefunction(target):
+        return target
 
-    def _http_get_klines(symbol, interval, start_time=None, end_time=None, limit=500):
-        url = "https://api.binance.com/api/v3/klines"
-        params = {
-            "symbol": str(symbol).upper(),
-            "interval": str(interval),
-            "limit": max(1, min(int(limit), 1000)),
-        }
-        st = _to_ms(start_time); et = _to_ms(end_time)
-        if st is not None: params["startTime"] = st
-        if et is not None: params["endTime"] = et
-        r = _session.get(url, params=params, timeout=30)
-        r.raise_for_status()
-        return r.json()
+    async def _async_adapter(*args, **kwargs):
+        # ЖОДНИХ лімітів/затримок тут — лише адаптація sync → async
+        return await asyncio.to_thread(target, *args, **kwargs)
 
-    async def get_klines(symbol, interval, start_time=None, end_time=None, limit=500):
-        return await asyncio.to_thread(_http_get_klines, symbol, interval, start_time, end_time, limit)
+    return _async_adapter
 
-    return get_klines
 
+# Єдиний вхід: беремо get_klines тільки через resolve_get_klines()
 get_klines = resolve_get_klines()
+
 
 # ── Резольвери для indicators / generate_targets (гнучкі імпорти) ─────────────
 def _import_first_ok(mod_names: List[str]):
@@ -484,11 +457,48 @@ def stage_targets(symbol: str, data_dir: str, intervals: List[str],
         except Exception as e:
             print(f"  ❌ {itv}: {type(e).__name__}: {e}")
 
+# ── Configs loader (TIMEFRAMES/TARGETS/VERSIONS) ─────────────────────────────
+def _load_configs_module():
+    # 1) пробуємо імпорт як модуль
+    try:
+        return importlib.import_module("test.Models.PPO.configs")
+    except Exception:
+        pass
+    # 2) пробуємо з файлу
+    cfg_path = ROOT / "test" / "Models" / "PPO" / "configs.py"
+    if cfg_path.exists():
+        spec = importlib.util.spec_from_file_location("ppo_configs_fallback", str(cfg_path))
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)  # type: ignore
+        return mod
+    raise RuntimeError("Не вдалось імпортувати test/Models/PPO/configs.py")
+
+def load_timeframes_targets_versions() -> Tuple[List[str], List[str], List[str]]:
+    mod = _load_configs_module()
+    TIMEFRAMES = list(getattr(mod, "TIMEFRAMES"))
+    TARGETS    = list(getattr(mod, "TARGETS"))
+    VFS        = dict(getattr(mod, "VARIANT_FEATURE_SETS"))
+    keys = sorted(int(k) for k in VFS.keys())
+    VERSIONS = [f"V{k}" for k in keys]
+    return TIMEFRAMES, TARGETS, VERSIONS
+
 # ── Stage 4: Training ────────────────────────────────────────────────────────
-def run_subprocess_module(module: str, args: List[str]) -> int:
+def run_subprocess_module(module: str, args: List[str], env: Optional[Dict[str,str]] = None) -> int:
     cmd = [sys.executable, "-m", module] + args
     print("   ▶", " ".join(cmd))
-    return subprocess.call(cmd)
+    return subprocess.call(cmd, env=env)
+
+def run_with_fallback(tag: str, module: str, base_args: List[str], extra_args: List[str], env: Dict[str,str]) -> int:
+    """
+    1) Перший запуск: base + extra (передаємо --timeframes/--modes/--versions)
+    2) Якщо RC != 0 — повтор без extra (сумісність із старими тренерами)
+    """
+    rc = run_subprocess_module(module, base_args + extra_args, env=env)
+    if rc == 0:
+        return rc
+    print(f"   ⚠️ {tag}: повтор без додаткових аргументів (--timeframes/--modes/--versions)")
+    return run_subprocess_module(module, base_args, env=env)
 
 def torch_cuda_available() -> bool:
     try:
@@ -503,14 +513,30 @@ def choose_device(device_pref: Optional[str]) -> str:
         return device_pref
     return "cuda" if torch_cuda_available() else "cpu"
 
-def stage_train(symbol: str, device_pref: Optional[str]) -> None:
+def stage_train(symbol: str, device_pref: Optional[str],
+                cfg_timeframes: List[str], cfg_targets: List[str], cfg_versions: List[str]) -> None:
     print(f"\n🧩 Stage 4/4 — Train models for {symbol}")
+    # ENV для тренерів (раптом читають з оточення)
+    env = os.environ.copy()
+    env.update({
+        "MB_TIMEFRAMES": ",".join(cfg_timeframes),
+        "MB_MODES": ",".join(cfg_targets),
+        "MB_VERSIONS": ",".join(cfg_versions),
+    })
 
-    # ── CNN → GPU якщо є (бо конволюції значно швидші)
+    # Додаткові аргументи (нові тренери)
+    extra = [
+        "--timeframes", ",".join(cfg_timeframes),
+        "--modes",      ",".join(cfg_targets),
+        "--versions",   ",".join(cfg_versions),
+    ]
+
+    # ── CNN → GPU якщо є (конволюції)
     cnn_device = choose_device(device_pref)
     rc = run_subprocess_module(
         "test.Models.CNN.train_cnn_crypto",
-        ["--symbol", symbol, "--device", cnn_device]
+        ["--symbol", symbol, "--device", cnn_device],
+        env=env
     )
     if rc != 0:
         print("   ⚠️ CNN trainer returned non-zero exit code.")
@@ -519,34 +545,42 @@ def stage_train(symbol: str, device_pref: Optional[str]) -> None:
     lstm_device = choose_device(device_pref)
     rc = run_subprocess_module(
         "test.Models.LSTM.train_lstm_crypto",
-        ["--symbol", symbol, "--device", lstm_device]
+        ["--symbol", symbol, "--device", lstm_device],
+        env=env
     )
     if rc != 0:
         print("   ⚠️ LSTM trainer returned non-zero exit code.")
 
-    # ── PPO → GPU для політики/критика
+    # ── PPO → GPU для політики/критика (з fallback)
     ppo_device = choose_device(device_pref)
-    rc = run_subprocess_module(
+    rc = run_with_fallback(
+        "PPO",
         "test.Models.PPO.ppo_train",
-        ["--symbol", symbol, "--device", ppo_device]
+        ["--symbol", symbol, "--device", ppo_device],
+        extra_args=extra,
+        env=env
     )
     if rc != 0:
         print("   ⚠️ PPO trainer returned non-zero exit code.")
 
-    # ── DQN → GPU якщо є
+    # ── DQN → GPU якщо є (з fallback)
     dqn_device = choose_device(device_pref)
-    rc = run_subprocess_module(
+    rc = run_with_fallback(
+        "DQN",
         "test.Models.DQN.train_all_dqn",
-        ["--symbol", symbol, "--device", dqn_device]
+        ["--symbol", symbol, "--device", dqn_device],
+        extra_args=extra,
+        env=env
     )
     if rc != 0:
         print("   ⚠️ DQN trainer returned non-zero exit code.")
 
-    # ── Transformers → GPU якщо є
+    # ── Transformers → GPU якщо є (ймовірно не потребують tf/targets; даємо лише env)
     tr_device = choose_device(device_pref)
     rc = run_subprocess_module(
         "test.Models.Transformer.train_all_transformers",
-        ["--symbol", symbol, "--device", tr_device]
+        ["--symbol", symbol, "--device", tr_device],
+        env=env
     )
     if rc != 0:
         print("   ⚠️ Transformer trainer returned non-zero exit code.")
@@ -554,12 +588,12 @@ def stage_train(symbol: str, device_pref: Optional[str]) -> None:
     # ── XGBoost → --gpu якщо CUDA доступна/попросили
     xgb_use_gpu = (choose_device(device_pref) == "cuda")
     xgb_args = ["--symbol", symbol] + (["--gpu"] if xgb_use_gpu else [])
-    rc = run_subprocess_module("test.Models.XGBoost.train_all_xgboost", xgb_args)
+    rc = run_subprocess_module("test.Models.XGBoost.train_all_xgboost", xgb_args, env=env)
     if rc != 0:
         print("   ⚠️ XGBoost trainer returned non-zero exit code.")
 
     # ── QLearning (табличний) → CPU
-    rc = run_subprocess_module("test.Models.QLearning.train_all_qlearning", ["--symbol", symbol])
+    rc = run_subprocess_module("test.Models.QLearning.train_all_qlearning", ["--symbol", symbol], env=env)
     if rc != 0:
         print("   ⚠️ QLearning trainer returned non-zero exit code.")
 
@@ -567,7 +601,12 @@ def stage_train(symbol: str, device_pref: Optional[str]) -> None:
 def main():
     ap = argparse.ArgumentParser(description="Unified pipeline: download → indicators → targets → train (all models)")
     ap.add_argument("--symbol", default="BTCUSDT", help="e.g., BTCUSDT / ETHUSDT")
-    ap.add_argument("--intervals", default="1m,15m,30m,1h,4h,1d", help="comma-separated list")
+
+    # NEW: якщо не передано --intervals, беремо TIMEFRAMES з configs.py
+    ap.add_argument("--intervals", default=None,
+                    help="comma-separated list (e.g. 15m,1h,4h,1d). "
+                         "If omitted, TIMEFRAMES from test/Models/PPO/configs.py will be used.")
+
     ap.add_argument("--start", default=None, help="earliest start date YYYY-MM-DD (if files absent), default=2017-01-01")
     ap.add_argument("--limit", type=int, default=1000, help="max klines per request")
     ap.add_argument("--throttle", type=float, default=0.05, help="delay between requests in seconds (Stage 1)")
@@ -591,11 +630,22 @@ def main():
     ap.add_argument("--no-progress", action="store_true", help="Disable download progress bar (Stage 1)")
     args = ap.parse_args()
 
+    # підтягуємо TIMEFRAMES/TARGETS/VERSIONS з configs.py
+    cfg_timeframes, cfg_targets, cfg_versions = load_timeframes_targets_versions()
+    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | INFO | configs.py -> "
+          f"TIMEFRAMES={cfg_timeframes} TARGETS={cfg_targets} VERSIONS={cfg_versions}")
+
     symbol = args.symbol.upper()
     data_dir = os.path.join("test", "data", symbol)
     ensure_dir(data_dir)
 
-    intervals = [s.strip() for s in args.intervals.split(",") if s.strip()]
+    # Інтервали: якщо --intervals не задано → беремо з configs.py
+    if args.intervals is None or not str(args.intervals).strip():
+        intervals = list(cfg_timeframes)
+        print(f"   ➜ using TIMEFRAMES from configs.py: {intervals}")
+    else:
+        intervals = [s.strip() for s in args.intervals.split(",") if s.strip()]
+        print(f"   ➜ using TIMEFRAMES from --intervals: {intervals}")
 
     # 1) download (пропускаємо, якщо raw існує і не --force-download)
     stage_download(symbol, data_dir, intervals, start=args.start, limit=args.limit,
@@ -614,10 +664,12 @@ def main():
         skip_1m=args.skip_1m_targets, force_targets=args.force_targets
     )
 
-    # 4) training
-    stage_train(symbol, device_pref=args.device)
+    # 4) training (тут уже також передаємо timeframes/targets/versions у тренери з fallback)
+    stage_train(symbol, device_pref=args.device,
+                cfg_timeframes=cfg_timeframes, cfg_targets=cfg_targets, cfg_versions=cfg_versions)
 
     print("\n✅ Pipeline done.")
 
 if __name__ == "__main__":
     main()
+

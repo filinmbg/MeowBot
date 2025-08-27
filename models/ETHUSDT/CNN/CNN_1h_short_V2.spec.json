@@ -1,0 +1,12 @@
+{
+  "features": [
+    "macd",
+    "ema_20"
+  ],
+  "lookback": 64,
+  "target_col": "target_short",
+  "in_channels": 2,
+  "created": "2025-08-15T14:31:49.408566Z",
+  "model_file": "CNN_1h_short_V2.pt",
+  "scaler_file": "CNN_1h_short_V2.scaler.npz"
+}

@@ -1,544 +1,786 @@
-# test/Models/PPO/ppo_train.py
-import sys as _sys
-from . import configs as _cnn_configs
-_sys.modules.setdefault("configs", _cnn_configs)
-import os
-import json
-import warnings
-import argparse
-import shutil
-from typing import List, Tuple, Optional
+# -*- coding: utf-8 -*-
+"""
+PPO multi-runner with:
+- single-line progress logs per model
+- resume from *.last.zip + progress.json
+- gymnasium-compatible env + Monitor (no gym.TimeLimit)
+- adaptive parallel scaler:
+    * periodic check every 2 minutes when load is below threshold
+    * if load >= threshold -> next periodic check after 15 minutes
+    * NO other checks (no instant retries, no backoffs)
+    * after a job finishes — the parallel slot is CLOSED (limit decreases by 1)
+    * cap at MAX_PARALLEL=20
+Output artifacts per model:
+    {models_dir}/{model}.zip
+    {models_dir}/{model}.best.zip
+    {models_dir}/{model}.last.zip
+    {models_dir}/{model}.vecnorm.pkl}
+    {models_dir}/{model}.spec.json
+    {logs_dir}/{model}.csv
+    {logs_dir}/{model}.monitor.csv (sb3 Monitor)
+    {logs_dir}/{model}_progress.json
+"""
+
+from __future__ import annotations
+
+import os, sys, json, time, math, argparse, traceback, threading, warnings
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional, List, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
-# --- gymnasium first, fallback to gym ---
-try:
-    import gymnasium as gym
-    from gymnasium import spaces
-except ImportError:
-    import gym
-    from gym import spaces
-
-import torch
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, f1_score
+# ==== RL / Gym ====
+import gymnasium as gym
+from gymnasium import spaces
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-# ---- robust import of configs (works with -m) --------------------------------
+# Silence SB3 CUDA warning for MLP policies
+warnings.filterwarnings(
+    "ignore",
+    message=r"You are trying to run PPO on the GPU, but it is primarily intended to run on the CPU.*",
+    category=UserWarning
+)
+
+# ==== Torch (for device info) ====
 try:
-    from .configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
+    import torch
 except Exception:
-    try:
-        from test.Models.PPO.configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
-    except Exception:
-        from configs import TIMEFRAMES, TARGETS, VARIANT_FEATURE_SETS
+    torch = None
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+# ==== Utilization ====
+try:
+    import psutil
+except Exception:
+    psutil = None
 
-# =======================
-# Globals (will be overridden in main by --symbol)
-# =======================
-SYMBOL = "BTCUSDT"
-DATA_DIR = os.path.join("test", "data", SYMBOL)
-MODEL_DIR = "models/PPO"
-LOG_DIR = "logs/PPO"
-TB_DIR = os.path.join(LOG_DIR, "tb")
-RESULTS_CSV = os.path.join(MODEL_DIR, "ppo_training_results.csv")
-FEATURES_MANIFEST = os.path.join(MODEL_DIR, "features_manifest.csv")
+try:
+    import pynvml
+    _NVML_OK = True
+    pynvml.nvmlInit()
+except Exception:
+    _NVML_OK = False
 
-# =======================
-# Reproducibility
-# =======================
-SEED = 42
-np.random.seed(SEED)
-torch.manual_seed(SEED)
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 
-# =======================
-# Path helpers
-# =======================
-def ensure_dirs(*paths: str):
-    for p in paths:
-        os.makedirs(p, exist_ok=True)
+MAX_PARALLEL = 50
 
-def compute_paths(symbol: str,
-                  data_root: str = "test/data",
-                  models_dir: Optional[str] = None,
-                  logs_dir: Optional[str] = None,
-                  tb_subdir: Optional[str] = None) -> Tuple[str, str, str, str, str, str]:
+# Main threshold (norm) = 70%
+# - below 0.70: it's okay to start more work (2-min cadence)
+# - at/above 0.70: too busy (next check in 15 min)
+UTIL_THRESHOLD = 0.70
+
+CHECK_COOLDOWN_OK = 120    # 2 min
+CHECK_COOLDOWN_HIGH = 900  # 15 min
+
+# kept for compatibility (not used in the new flow)
+START_ATTEMPT_BACKOFF = 300.0
+START_LOG_COOLDOWN    = 5.0
+
+TOTAL_UPDATES = 1000
+STEPS_PER_UPDATE = 2048
+TOTAL_TIMESTEPS = TOTAL_UPDATES * STEPS_PER_UPDATE  # 2_048_000
+
+DEFAULT_TIMEFRAMES = ["1d"]
+DEFAULT_MODES = ["long", "short"]
+DEFAULT_VERSIONS = [f"V{i}" for i in range(1, 15+1)]  # V1..V15
+
+# -----------------------------------------------------------------------------
+# Paths / helpers
+# -----------------------------------------------------------------------------
+
+def ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def round2(x: float) -> float:
+    return float(np.round(x, 3))
+
+def model_name(symbol: str, tf: str, mode: str, version: str) -> str:
+    # PPO_1d_long_V1_BTCUSDT
+    return f"PPO_{tf}_{mode}_{version}_{symbol}"
+
+# -----------------------------------------------------------------------------
+# Simple trading env
+# -----------------------------------------------------------------------------
+
+EXCLUDE_COLS = {"open_time", "close_time", "target_long", "target_short"}
+
+class SimpleTradingEnv(gym.Env):
     """
-    Returns (data_dir, model_dir, log_dir, tb_dir, results_csv, features_manifest)
-    - For BTCUSDT keep legacy dirs: models/PPO, logs/PPO
-    - For others use suffixed dirs: models/PPO_<SYMBOL>, logs/PPO_<SYMBOL>
+    Прості ознаки:
+    - числові колонки + категоріальні/булеві кодуються (category codes / int)
+    - нормування Z-score
+    - епізод фіксованої довжини
+    - Discrete(3): 0=short, 1=hold, 2=long
     """
-    symbol = symbol.upper()
-    data_dir = os.path.join(data_root, symbol)
+    metadata = {"render_modes": []}
 
-    default_models = "models/PPO" if symbol == "BTCUSDT" else f"models/PPO_{symbol}"
-    default_logs   = "logs/PPO"   if symbol == "BTCUSDT" else f"logs/PPO_{symbol}"
-
-    model_dir = models_dir or default_models
-    log_dir   = logs_dir   or default_logs
-    tb_dir    = os.path.join(log_dir, tb_subdir or "tb")
-
-    results_csv = os.path.join(model_dir, "ppo_training_results.csv")
-    features_manifest = os.path.join(model_dir, "features_manifest.csv")
-    return data_dir, model_dir, log_dir, tb_dir, results_csv, features_manifest
-
-# =======================
-# Data utils
-# =======================
-def load_dataframe(timeframe: str, target: str) -> pd.DataFrame:
-    csv_path = os.path.join(
-        DATA_DIR,
-        f"{SYMBOL}_{timeframe}_critical_indicators_with_targets_{target}.csv"
-    )
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(csv_path)
-    df = pd.read_csv(csv_path)
-    for col in ["timestamp", "time", "open_time", "date"]:
-        if col in df.columns:
-            df = df.sort_values(col).reset_index(drop=True)
-            break
-    df = df.dropna().reset_index(drop=True)
-    return df
-
-def time_split_indices(n: int, val_ratio: float = 0.2) -> Tuple[np.ndarray, np.ndarray]:
-    split = int(n * (1 - val_ratio))
-    idx = np.arange(n)
-    return idx[:split], idx[split:]
-
-def fit_scale_features(train_X: np.ndarray) -> StandardScaler:
-    scaler = StandardScaler()
-    scaler.fit(train_X)
-    return scaler
-
-def transform_features(scaler: StandardScaler, X: np.ndarray) -> np.ndarray:
-    return scaler.transform(X).astype(np.float32)
-
-def build_sequences(X: np.ndarray, y: np.ndarray, seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
-    n = len(X)
-    if n < seq_len:
-        return np.empty((0, seq_len, X.shape[1]), dtype=np.float32), np.empty((0,), dtype=np.float32)
-    X_seq, y_seq = [], []
-    for t in range(seq_len - 1, n):
-        X_seq.append(X[t - seq_len + 1:t + 1])
-        y_seq.append(y[t])
-    return np.asarray(X_seq, dtype=np.float32), np.asarray(y_seq, dtype=np.float32)
-
-# =======================
-# Simple sequence env (1 sample = 1 step/episode)
-# =======================
-class SeqBinaryEnv(gym.Env):
-    """
-    Кожен епізод — один вектор (T,F), flatten до (T*F).
-    Дія: 0 або 1. Нагорода: 1.0 якщо дія == y, інакше 0.0.
-    """
-    metadata = {"render_modes": []}  # gymnasium-compatible
-
-    def __init__(self, X_seq: np.ndarray, y_seq: np.ndarray):
+    def __init__(self, df: pd.DataFrame, mode: str, episode_len: int = 500):
         super().__init__()
-        assert X_seq.ndim == 3, "X_seq shape must be (N, T, F)"
-        assert len(X_seq) == len(y_seq)
-        self.X_seq = X_seq
-        self.y_seq = y_seq.astype(np.int64)
-        self.n, self.T, self.F = X_seq.shape
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.T * self.F,), dtype=np.float32
-        )
-        self.action_space = spaces.Discrete(2)
-        self._idx = 0
+        self.mode = mode
 
-    def reset(self, *, seed=None, options=None):
+        df = df.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+
+        base = df[[c for c in df.columns if c not in EXCLUDE_COLS]]
+
+        num_df = base.select_dtypes(include=[np.number])
+
+        cat_df = base.select_dtypes(include=["object", "category", "bool"])
+        if not cat_df.empty:
+            cat_encoded = pd.DataFrame(index=cat_df.index)
+            for c in cat_df.columns:
+                s = cat_df[c]
+                if s.dtype == bool:
+                    cat_encoded[c] = s.astype(int)
+                else:
+                    try:
+                        cat = s.astype("category")
+                        cat_encoded[c] = cat.cat.codes.replace(-1, 0)
+                    except Exception:
+                        cat_encoded[c] = pd.to_numeric(s, errors="coerce").fillna(0.0)
+            feats = pd.concat([num_df, cat_encoded], axis=1)
+        else:
+            feats = num_df
+
+        if feats.shape[1] == 0:
+            raise RuntimeError(
+                "Відсутні придатні для навчання фічі (усі колонки службові або нечислові)."
+            )
+
+        feats = feats.apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(np.float32)
+
+        arr = feats.values
+        mean = arr.mean(axis=0, keepdims=True)
+        std = arr.std(axis=0, ddof=0, keepdims=True)
+        std[std == 0.0] = 1.0
+        self.features = ((arr - mean) / std).astype(np.float32)
+
+        if mode == "long" and "target_long" in df.columns:
+            self.targets = df["target_long"].fillna(0.0).astype(float).values
+        elif mode == "short" and "target_short" in df.columns:
+            self.targets = df["target_short"].fillna(0.0).astype(float).values
+        else:
+            self.targets = np.zeros(len(df), dtype=np.float32)
+
+        self.episode_len = int(episode_len)
+        self.pos = 0
+        self.step_in_episode = 0
+
+        obs_dim = self.features.shape[1]
+        self.observation_space = spaces.Box(low=-10, high=10, shape=(obs_dim,), dtype=np.float32)
+        self.action_space = spaces.Discrete(3)
+
+    def reset(self, *, seed: Optional[int]=None, options: Optional[dict]=None):
         super().reset(seed=seed)
-        if self._idx >= self.n:
-            self._idx = 0
-        obs = self.X_seq[self._idx].reshape(-1).astype(np.float32)
-        return obs, {}
+        if len(self.features) <= self.episode_len + 2:
+            self.pos = 0
+        else:
+            self.pos = np.random.randint(0, len(self.features) - self.episode_len - 1)
+        self.step_in_episode = 0
+        obs = self.features[self.pos]
+        return obs.astype(np.float32), {}
 
-    def step(self, action):
-        y = int(self.y_seq[self._idx])
-        a = int(np.asarray(action).reshape(-1)[0])
-        reward = 1.0 if a == y else 0.0
+    def step(self, action: int):
+        t = float(self.targets[self.pos])
+        if self.mode == "long":
+            reward = (1.0 if action == 2 else 0.0) * t - (1.0 if action == 0 else 0.0) * (1.0 - t) * 0.1
+        else:
+            reward = (1.0 if action == 0 else 0.0) * t - (1.0 if action == 2 else 0.0) * (1.0 - t) * 0.1
 
-        self._idx += 1
-        terminated = True
-        truncated = False
-        if self._idx >= self.n:
-            self._idx = 0
-        next_obs = self.X_seq[self._idx].reshape(-1).astype(np.float32)
-        info = {}
-        return next_obs, reward, terminated, truncated, info
+        self.pos = min(self.pos + 1, len(self.features) - 1)
+        self.step_in_episode += 1
+        terminated = self.step_in_episode >= self.episode_len
+        truncated = self.pos >= len(self.features) - 1
 
-# =======================
-# Feature spec + scaler save
-# =======================
-def save_feature_spec(base_path_no_ext: str,
-                      model_name: str,
-                      timeframe: str,
-                      target: str,
-                      variant_id: str,
-                      features: List[str],
-                      seq_len: int,
-                      scaler: StandardScaler):
-    spec = {
-        "model_name": model_name,
-        "symbol": SYMBOL,
-        "timeframe": timeframe,
-        "target": target,
-        "variant_id": str(variant_id),
-        "seq_len": int(seq_len),
-        "features": list(features),
-        "n_features": int(len(features)),
-        "preprocessing": {"scaler": "StandardScaler", "with_mean": True, "with_std": True},
-        "seed": int(SEED)
-    }
-    with open(base_path_no_ext + ".features.json", "w", encoding="utf-8") as f:
+        obs = self.features[self.pos].astype(np.float32)
+        return obs, float(reward), bool(terminated), bool(truncated), {}
+
+# -----------------------------------------------------------------------------
+# Data loading for env
+# -----------------------------------------------------------------------------
+
+def load_env_dataframe(symbol: str, timeframe: str, mode: str, data_dir: str) -> pd.DataFrame:
+    fname = f"{symbol}_{timeframe}_critical_indicators_with_targets_{mode}.csv"
+    path = os.path.join(data_dir, fname)
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    alt = os.path.join(data_dir, f"{symbol}_{timeframe}_critical_indicators.csv")
+    if os.path.exists(alt):
+        return pd.read_csv(alt)
+    raise FileNotFoundError(f"Не знайдено дані для середовища: {path}")
+
+def make_env(symbol: str, timeframe: str, mode: str, data_dir: str, logs_dir: str):
+    def _thunk():
+        df = load_env_dataframe(symbol, timeframe, mode, data_dir)
+        env = SimpleTradingEnv(df, mode=mode, episode_len=500)
+        env = Monitor(env, filename=None)
+        return env
+    vec = DummyVecEnv([_thunk])
+    vec = VecNormalize(vec, norm_obs=True, norm_reward=True, clip_obs=10.0, clip_reward=10.0)
+    return vec
+
+# -----------------------------------------------------------------------------
+# Utilization helpers
+# -----------------------------------------------------------------------------
+
+def get_gpu_utilization() -> float:
+    if not _NVML_OK:
+        return 0.0
+    try:
+        n = pynvml.nvmlDeviceGetCount()
+        utils = []
+        for i in range(n):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            u = pynvml.nvmlDeviceGetUtilizationRates(h)
+            utils.append(u.gpu / 100.0)
+        if not utils:
+            return 0.0
+        return max(0.0, min(1.0, max(utils)))
+    except Exception:
+        return 0.0
+
+def get_cpu_ram_utilization() -> Tuple[float, float]:
+    cpu = psutil.cpu_percent(interval=0.2)/100.0 if psutil else 0.0
+    ram = psutil.virtual_memory().percent/100.0 if psutil else 0.0
+    return cpu, ram
+
+def get_max_utilization() -> float:
+    cpu, ram = get_cpu_ram_utilization()
+    gpu = get_gpu_utilization()
+    return max(cpu, ram, gpu)
+
+# -----------------------------------------------------------------------------
+# IO: progress/spec/log
+# -----------------------------------------------------------------------------
+
+def write_spec(models_dir: str, name: str, spec: Dict[str, Any]):
+    path = os.path.join(models_dir, f"{name}.spec.json")
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(spec, f, ensure_ascii=False, indent=2)
 
-    mean_ = getattr(scaler, "mean_", None)
-    scale_ = getattr(scaler, "scale_", None)
-    var_ = getattr(scaler, "var_", None)
-    if mean_ is not None and scale_ is not None:
-        np.savez_compressed(
-            base_path_no_ext + ".scaler.npz",
-            mean_=np.asarray(mean_, dtype=np.float32),
-            scale_=np.asarray(scale_, dtype=np.float32),
-            var_=np.asarray(var_ if var_ is not None else np.square(scale_), dtype=np.float32)
-        )
+def read_progress(logs_dir: str, name: str) -> int:
+    path = os.path.join(logs_dir, f"{name}_progress.json")
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        return int(j.get("timesteps_done", 0))
+    except Exception:
+        return 0
 
-    row = {
-        "model_name": model_name,
-        "symbol": SYMBOL,
-        "timeframe": timeframe,
-        "target": target,
-        "variant_id": str(variant_id),
-        "seq_len": int(seq_len),
-        "n_features": int(len(features)),
-        "features_csv": "|".join(features)
-    }
-    if os.path.exists(FEATURES_MANIFEST):
-        dfm = pd.read_csv(FEATURES_MANIFEST)
-        dfm = pd.concat([dfm, pd.DataFrame([row])], ignore_index=True)
-    else:
-        dfm = pd.DataFrame([row])
-    dfm.to_csv(FEATURES_MANIFEST, index=False)
+def write_progress(logs_dir: str, name: str, steps: int):
+    path = os.path.join(logs_dir, f"{name}_progress.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"timesteps_done": int(steps)}, f)
 
-# =======================
-# Callback: per-epoch logging + early stop (with min_epochs)
-# =======================
-class PrintAndCSVCallback(BaseCallback):
-    def __init__(self, model_name: str, log_path: str,
-                 X_val: np.ndarray, y_val: np.ndarray,
-                 patience: int = 12, verbose: int = 0,
-                 min_epochs: int = 30):
+# -----------------------------------------------------------------------------
+# Callbacks: Eval-lite + RolloutDiag
+# -----------------------------------------------------------------------------
+
+class CustomEvalCallback(BaseCallback):
+    def __init__(self, eval_env, eval_freq: int = STEPS_PER_UPDATE, n_episodes: int = 5, verbose: int = 0):
         super().__init__(verbose)
-        self.model_name = model_name
-        self.log_path = log_path
-        self.X_val = X_val.astype(np.float32)  # (N, T*F)
-        self.y_val = y_val.astype(np.int64)
-        self.epoch = 0
-        self.best_f1 = -1.0
-        self.best_val_loss = float("inf")  # surrogate: 1 - F1
-        self.no_improve = 0
-        self.patience = int(patience)
-        self.min_epochs = int(min_epochs)
-
-        with open(self.log_path, "w", encoding="utf-8") as f:
-            f.write("epoch,train_loss,val_loss,val_acc,eval_mean_reward,val_f1,best_f1\n")
+        self.eval_env = eval_env
+        self.eval_freq = int(max(1, eval_freq))
+        self.n_episodes = int(max(1, n_episodes))
+        self.last_mean_reward: float = 0.0
+        self.last_std_reward: float  = float("nan")
 
     def _on_step(self) -> bool:
         return True
 
-    def _on_rollout_end(self) -> bool:
-        train_loss = -1.0  # policy/value/entropy — див. у TensorBoard
+    def _on_training_start(self) -> None:
+        pass
 
-        preds = []
-        for i in range(len(self.X_val)):
-            obs = self.X_val[i].reshape(1, -1)
-            action, _ = self.model.predict(obs, deterministic=True)
-            action = int(np.asarray(action).reshape(-1)[0])
-            preds.append(action)
+    def _on_step_end(self) -> None:
+        pass
 
-        y_true = self.y_val
-        y_pred = np.asarray(preds, dtype=np.int64)
-        val_acc = float(accuracy_score(y_true, y_pred))
-        val_f1  = float(f1_score(y_true, y_pred, zero_division=0))
-        val_loss = 1.0 - val_f1
-        eval_mean_reward = val_acc  # у цьому env це корелює з acc
+    def _on_rollout_start(self) -> None:
+        pass
 
-        self.epoch += 1
+    def _on_training_end(self) -> None:
+        pass
 
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(f"{self.epoch},{train_loss:.6f},{val_loss:.6f},{val_acc:.6f},{eval_mean_reward:.6f},{val_f1:.6f},{max(self.best_f1,val_f1):.6f}\n")
+    def _on_step_training(self) -> None:
+        pass
 
-        print(f"[{self.model_name}] epoch {self.epoch}: val_loss={val_loss:.6f}, val_acc={val_acc:.6f}, val_f1={val_f1:.6f}")
+    def _on_step_rollout(self) -> None:
+        pass
 
-        improved = (val_f1 > self.best_f1 + 1e-6) or (abs(val_f1 - self.best_f1) <= 1e-6 and val_loss < self.best_val_loss - 1e-6)
-        if improved:
-            self.best_f1 = val_f1
-            self.best_val_loss = val_loss
-            self.model.save(self.best_path())
-            self.no_improve = 0
+    def _init_callback(self) -> None:
+        pass
+
+    def _on_step_callback(self) -> None:
+        pass
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps % self.eval_freq != 0:
+            return True
+
+        old_training = None
+        try:
+            if isinstance(self.eval_env, VecNormalize):
+                old_training = self.eval_env.training
+                self.eval_env.training = False
+        except Exception:
+            pass
+
+        ep_rewards = []
+        for _ in range(self.n_episodes):
+            obs = self.eval_env.reset()
+            if isinstance(obs, tuple):
+                obs = obs[0]
+            done = False
+            rsum = 0.0
+            while not done:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, done, _ = self._step_eval_env(action)
+                rsum += float(reward)
+            ep_rewards.append(rsum)
+
+        if ep_rewards:
+            arr = np.asarray(ep_rewards, dtype=np.float32)
+            self.last_mean_reward = float(arr.mean())
+            self.last_std_reward  = float(arr.std())
         else:
-            self.no_improve += 1
-            # Early stop дозволений лише після досягнення min_epochs
-            if (self.epoch >= self.min_epochs) and (self.no_improve >= self.patience):
-                print(f"[{self.model_name}] ⏹️ early stop at epoch {self.epoch} (best_f1={self.best_f1:.4f})")
-                return False
+            self.last_mean_reward, self.last_std_reward = 0.0, float("nan")
 
+        try:
+            if isinstance(self.eval_env, VecNormalize) and (old_training is not None):
+                self.eval_env.training = old_training
+        except Exception:
+            pass
         return True
 
-    def best_path(self) -> str:
-        base = os.path.join(MODEL_DIR, f"{self.model_name}")
-        return base + ".zip"
+    def _step_eval_env(self, action):
+        if np.isscalar(action):
+            act = np.array([int(action)], dtype=np.int64)
+        else:
+            arr = np.asarray(action)
+            act = arr.reshape(-1).astype(np.int64)
+        obs, rewards, dones, infos = self.eval_env.step(act)
+        reward = float(rewards[0] if isinstance(rewards, (list, np.ndarray)) else rewards)
+        done   = bool(dones[0] if isinstance(dones, (list, np.ndarray)) else dones)
+        return obs, reward, done, infos
 
-# =======================
-# Helper: locate or materialize an existing checkpoint to canonical path
-# =======================
-def find_or_materialize_best(model_name: str) -> Optional[str]:
-    """
-    Returns a path to an existing checkpoint.
-    Prefers canonical models/.../<model>.zip.
-    If only eval-callback 'tmp/<model>/best_model.zip' exists, copies it to canonical and returns the canonical path.
-    """
-    main_zip = os.path.join(MODEL_DIR, model_name + ".zip")
-    if os.path.exists(main_zip):
-        return main_zip
 
-    eval_best = os.path.join(MODEL_DIR, "tmp", model_name, "best_model.zip")
-    if os.path.exists(eval_best):
+class RolloutDiagCallback(BaseCallback):
+    def __init__(self, model_name: str):
+        super().__init__()
+        self.model_name = model_name
+
+    def _init_callback(self) -> None:
+        pass
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
         try:
-            shutil.copy2(eval_best, main_zip)
-            if os.path.exists(main_zip):
-                return main_zip
+            acts = np.array(self.model.rollout_buffer.actions).reshape(-1)
+            acts = acts.astype(int)
+            cnts = np.bincount(acts, minlength=3)
+            p = cnts / max(1, cnts.sum())
+            ent = -np.sum(p[p>0]*np.log(p[p>0]))
+            print(f"{ts()} | INFO | [PPO {self.model_name}] rollout: actions={cnts.tolist()} p={np.round(p,3).tolist()} H={round2(float(ent))}")
         except Exception:
-            # if copy fails, at least signal that something exists
-            return eval_best
-    return None
+            pass
 
-# =======================
-# Train one model (PPO)
-# =======================
-def train_one(timeframe: str,
-              target: str,
-              variant_id: str,
-              features: List[str],
-              seq_len: int = 32,
-              total_epochs: int = 100,
-              patience: int = 12,
-              min_epochs: int = 30,
-              lr: float = 1e-4,
-              n_steps: int = 4096,
-              batch_size: int = 256,
-              device: str = "cpu") -> dict:
-    """
-    total_epochs — кількість rollout-циклів (аналог "епох").
-    Кожен цикл = on_rollout_end → логування/валідація/early-stop.
-    """
-    model_name = f"PPO_{timeframe}_{target}_V{variant_id}"
-    base_no_ext = os.path.join(MODEL_DIR, model_name)
-    log_path = os.path.join(LOG_DIR, f"{model_name}_log.csv")
+# -----------------------------------------------------------------------------
+# Training single
+# -----------------------------------------------------------------------------
 
-    try:
-        df = load_dataframe(timeframe, target)
+@dataclass
+class TrainConfig:
+    symbol: str
+    device: str
+    timeframe: str
+    mode: str
+    version: str
+    data_dir: str
+    models_dir: str
+    logs_dir: str
 
-        missing = [f for f in features if f not in df.columns]
-        if missing:
-            return {"model": model_name, "status": f"❌ missing features: {missing}", "val_acc": None, "val_f1": None}
+def train_single(cfg: TrainConfig) -> int:
+    name = model_name(cfg.symbol, cfg.timeframe, cfg.mode, cfg.version)
+    print(f"{ts()} | INFO | ================================================================================")
+    print(f"{ts()} | INFO | [PPO] TRAINING MODEL: {name}")
+    print(f"{ts()} | INFO | [PPO] CONFIG: symbol={cfg.symbol} timeframe={cfg.timeframe} mode={cfg.mode} version={cfg.version} device={cfg.device}")
+    print(f"{ts()} | INFO | ================================================================================")
 
-        target_col = f"target_{target}" if f"target_{target}" in df.columns else "target"
-        if target_col not in df.columns:
-            return {"model": model_name, "status": f"❌ missing target column: {target_col}", "val_acc": None, "val_f1": None}
+    ensure_dir(cfg.logs_dir)
+    ensure_dir(cfg.models_dir)
 
-        X_all = df[features].values.astype(np.float32)
-        y_all = df[target_col].values.astype(np.float32)
+    model_zip   = os.path.join(cfg.models_dir, f"{name}.zip")
+    best_zip    = os.path.join(cfg.models_dir, f"{name}.best.zip")
+    last_zip    = os.path.join(cfg.models_dir, f"{name}.last.zip")
+    vecnorm_pkl = os.path.join(cfg.models_dir, f"{name}.vecnorm.pkl")
+    csv_path    = os.path.join(cfg.logs_dir,   f"{name}.csv")
 
-        idx_train, idx_val = time_split_indices(len(X_all), val_ratio=0.2)
-        X_train_raw, y_train_raw = X_all[idx_train], y_all[idx_train]
-        X_val_raw,   y_val_raw   = X_all[idx_val],   y_all[idx_val]
+    train_env = make_env(cfg.symbol, cfg.timeframe, cfg.mode, cfg.data_dir, cfg.logs_dir)
 
-        scaler = fit_scale_features(X_train_raw)
-        save_feature_spec(
-            base_path_no_ext=base_no_ext,
-            model_name=model_name,
-            timeframe=timeframe,
-            target=target,
-            variant_id=variant_id,
-            features=features,
-            seq_len=seq_len,
-            scaler=scaler
-        )
+    already = read_progress(cfg.logs_dir, name)
 
-        X_train = transform_features(scaler, X_train_raw)
-        X_val   = transform_features(scaler, X_val_raw)
+    if torch is not None and cfg.device == "cuda":
+        try:
+            cuda_ok = bool(torch.cuda.is_available())
+            dev_name = torch.cuda.get_device_name(0) if cuda_ok else "N/A"
+            print(f"{ts()} | INFO | [PPO {name}] torch device: cuda | cuda_available={cuda_ok}")
+            print(f"{ts()} | INFO | [PPO {name}] cuda device name: {dev_name}")
+        except Exception:
+            pass
 
-        Xtr_seq, ytr_seq = build_sequences(X_train, y_train_raw, seq_len=seq_len)
-        Xva_seq, yva_seq = build_sequences(X_val,   y_val_raw,   seq_len=seq_len)
-
-        if len(Xtr_seq) == 0 or len(Xva_seq) == 0:
-            return {"model": model_name, "status": "❌ not enough data for sequences", "val_acc": None, "val_f1": None}
-
-        train_env = Monitor(SeqBinaryEnv(Xtr_seq, ytr_seq))
-
-        model = PPO(
-            policy="MlpPolicy",
-            env=train_env,
-            verbose=0,
-            learning_rate=lr,
-            n_steps=n_steps,
-            batch_size=min(batch_size, n_steps),
-            clip_range=0.15,
-            gae_lambda=0.95,
-            ent_coef=0.01,
-            device=device,
-            seed=SEED,
-            tensorboard_log=TB_DIR
-        )
-
-        cb = PrintAndCSVCallback(
-            model_name=model_name,
-            log_path=log_path,
-            X_val=Xva_seq.reshape(len(Xva_seq), -1),
-            y_val=yva_seq,
-            patience=patience,
-            min_epochs=min_epochs
-        )
-
-        eval_env = Monitor(SeqBinaryEnv(Xva_seq, yva_seq))
-        eval_cb = EvalCallback(
-            eval_env=eval_env,
-            best_model_save_path=os.path.join(MODEL_DIR, "tmp", model_name),
-            log_path=os.path.join(LOG_DIR, "eval", model_name),
-            eval_freq=n_steps,
-            deterministic=True,
-            render=False
-        )
-
-        for _ in range(total_epochs):
-            model.learn(
-                total_timesteps=n_steps,
-                callback=[cb, eval_cb],
-                reset_num_timesteps=False,
-                progress_bar=False
-            )
-            if cb.no_improve >= patience and cb.epoch >= min_epochs:
-                break
-
-        best_zip = cb.best_path()
-        # fallback: if our callback didn't save for some reason, try to pick eval's best
-        if not os.path.exists(best_zip):
-            existing = find_or_materialize_best(model_name)
-            if existing is not None and os.path.exists(existing):
-                best_zip = existing
-
-        if os.path.exists(best_zip):
-            model = PPO.load(best_zip, device=device)
-
-        preds = []
-        for i in range(len(Xva_seq)):
-            obs = Xva_seq[i].reshape(1, -1).astype(np.float32)
-            action, _ = model.predict(obs, deterministic=True)
-            action = int(np.asarray(action).reshape(-1)[0])
-            preds.append(action)
-
-        y_true = yva_seq.astype(np.int64)
-        y_pred = np.asarray(preds, dtype=np.int64)
-        final_acc = float(accuracy_score(y_true, y_pred))
-        final_f1  = float(f1_score(y_true, y_pred, zero_division=0))
-
-        return {"model": model_name, "status": "✅ trained", "val_acc": final_acc, "val_f1": final_f1}
-
-    except Exception as e:
-        return {"model": model_name, "status": f"❌ error: {type(e).__name__}: {str(e)}", "val_acc": None, "val_f1": None}
-
-# =======================
-# Orchestrator
-# =======================
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol", default="BTCUSDT", help="Ticker symbol, e.g. ETHUSDT. Default: BTCUSDT.")
-    parser.add_argument("--data-root", default="test/data", help="Root folder with per-symbol subfolders.")
-    parser.add_argument("--models-dir", default=None, help="Override models dir (default by symbol).")
-    parser.add_argument("--logs-dir", default=None, help="Override logs dir (default by symbol).")
-    parser.add_argument("--tb-subdir", default="tb", help="TensorBoard subdir under logs dir (default: tb).")
-
-    parser.add_argument("--seq_len", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=100)     # кількість rollout-епох
-    parser.add_argument("--patience", type=int, default=12)
-    parser.add_argument("--min_epochs", type=int, default=30)  # мінімум епох до дозволу early-stop
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--n_steps", type=int, default=4096)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
-    args = parser.parse_args()
-
-    # compute dirs for symbol
-    data_dir, model_dir, log_dir, tb_dir, results_csv, features_manifest = compute_paths(
-        symbol=args.symbol, data_root=args.data_root,
-        models_dir=args.models_dir, logs_dir=args.logs_dir, tb_subdir=args.tb_subdir
-    )
-
-    # set globals used elsewhere
-    global SYMBOL, DATA_DIR, MODEL_DIR, LOG_DIR, TB_DIR, RESULTS_CSV, FEATURES_MANIFEST
-    SYMBOL = args.symbol.upper()
-    DATA_DIR = data_dir
-    MODEL_DIR = model_dir
-    LOG_DIR = log_dir
-    TB_DIR = tb_dir
-    RESULTS_CSV = results_csv
-    FEATURES_MANIFEST = features_manifest
-
-    ensure_dirs(MODEL_DIR, LOG_DIR, TB_DIR)
-
-    print(f"🧩 Settings: symbol={SYMBOL} | data_dir={DATA_DIR} | models_dir={MODEL_DIR} | logs_dir={LOG_DIR} | tb_dir={TB_DIR} | device={args.device}")
-
-    results = []
-    total = len(TIMEFRAMES) * len(TARGETS) * len(VARIANT_FEATURE_SETS)
-    desc = f"🧠 Training PPO models on {args.device}"
-
-    with tqdm(total=total, desc=desc) as pbar:
-        for timeframe in TIMEFRAMES:
-            for target in TARGETS:
-                for variant_id, features in VARIANT_FEATURE_SETS.items():
-                    model_name = f"PPO_{timeframe}_{target}_V{variant_id}"
-
-                    # --- robust skip: canonical zip or eval best (materialized) ---
-                    existing = find_or_materialize_best(model_name)
-                    if existing is not None and os.path.exists(existing):
-                        print(f"{model_name}: ⏭️ already exists — skipped ({os.path.relpath(existing)})")
-                        pbar.update(1)
-                        continue
-
-                    res = train_one(
-                        timeframe=timeframe,
-                        target=target,
-                        variant_id=variant_id,
-                        features=features,
-                        seq_len=args.seq_len,
-                        total_epochs=args.epochs,
-                        patience=args.patience,
-                        min_epochs=args.min_epochs,
-                        lr=args.lr,
-                        n_steps=args.n_steps,
-                        batch_size=args.batch_size,
-                        device=args.device
-                    )
-                    print(f"{res['model']}: {res['status']} | acc={res['val_acc']}, f1={res['val_f1']}")
-                    results.append(res)
-                    pbar.update(1)
-
-    if results:
-        pd.DataFrame(results).to_csv(RESULTS_CSV, index=False)
-        print(f"📊 Results saved to {RESULTS_CSV}")
+    # створення/завантаження моделі
+    if os.path.exists(last_zip):
+        try:
+            model = PPO.load(last_zip, env=train_env, device=cfg.device, print_system_info=False)
+        except Exception:
+            model = PPO("MlpPolicy", train_env, verbose=0, device=cfg.device, n_steps=STEPS_PER_UPDATE)
     else:
-        print("✅ All models already trained — nothing to do.")
+        model = PPO("MlpPolicy", train_env, verbose=0, device=cfg.device, n_steps=STEPS_PER_UPDATE)
 
-    print(f"🧾 Features manifest: {FEATURES_MANIFEST}")
+    write_spec(cfg.models_dir, name, {
+        "algo": "PPO",
+        "symbol": cfg.symbol,
+        "timeframe": cfg.timeframe,
+        "mode": cfg.mode,
+        "version": cfg.version,
+        "device": cfg.device,
+        "total_updates": TOTAL_UPDATES,
+        "steps_per_update": STEPS_PER_UPDATE,
+        "total_timesteps": TOTAL_TIMESTEPS,
+        "created_at": ts(),
+    })
+
+    print(f"{ts()} | INFO | [PPO {name}] total_plan={TOTAL_TIMESTEPS} | already_done={already} -> remaining={max(0,TOTAL_TIMESTEPS - already)}")
+
+    # CSV header
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("update,steps,return_mean,return_std,best\n")
+
+    eval_cb = CustomEvalCallback(train_env, eval_freq=STEPS_PER_UPDATE, n_episodes=5, verbose=0)
+    diag_cb = RolloutDiagCallback(name)
+    cb = CallbackList([eval_cb, diag_cb])
+
+    best_ret = -1e9
+    steps_done = already
+    upd = 0
+
+    while steps_done < TOTAL_TIMESTEPS:
+        model.learn(
+            total_timesteps=STEPS_PER_UPDATE,
+            log_interval=None,
+            callback=cb,
+            progress_bar=False,
+            reset_num_timesteps=False
+        )
+        steps_done += STEPS_PER_UPDATE
+        upd += 1
+
+        ret_mean = getattr(eval_cb, "last_mean_reward", 0.0)
+        ret_std  = getattr(eval_cb, "last_std_reward", float("nan"))
+        if ret_mean > best_ret:
+            best_ret = float(ret_mean)
+            model.save(best_zip)
+
+        print(
+            f"{ts()} | INFO | [PPO {name}] upd={upd:04d} steps={steps_done} "
+            f"ret={round2(float(ret_mean))}±{('nan' if math.isnan(ret_std) else round2(float(ret_std)))} "
+            f"best={round2(float(best_ret)) if best_ret > -1e8 else '—'}"
+        )
+
+        try:
+            with open(csv_path, "a", encoding="utf-8") as f:
+                f.write(f"{upd},{steps_done},{ret_mean},{ret_std},{best_ret}\n")
+        except Exception:
+            pass
+
+        model.save(last_zip)
+        train_env.save(vecnorm_pkl)
+        write_progress(cfg.logs_dir, name, steps_done)
+
+    model.save(model_zip)
+    train_env.save(vecnorm_pkl)
+
+    print(f"{ts()} | INFO | [PPO {name}] saved: {model_zip}")
+    print(f"{ts()} | INFO | [PPO {name}] csv:   {csv_path}")
+    print(f"{ts()} | INFO | [PPO {name}] best:  {best_zip}")
+    print(f"{ts()} | INFO | [PPO {name}] vecnormalize: {vecnorm_pkl}")
+    print(f"{ts()} | INFO | [PPO {name}] spec:  {os.path.join(cfg.models_dir, f'{name}.spec.json')}")
+
+    return 0
+
+# -----------------------------------------------------------------------------
+# Parallel runner
+# -----------------------------------------------------------------------------
+
+class Worker(threading.Thread):
+    def __init__(self, cfg: TrainConfig):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.rc: Optional[int] = None
+        self.exc: Optional[str] = None
+
+    def run(self):
+        try:
+            self.rc = train_single(self.cfg)
+        except BaseException:
+            self.rc = 1
+            self.exc = traceback.format_exc()
+            print(f"{ts()} | ERROR | [PPO PARALLEL] crash in {model_name(self.cfg.symbol, self.cfg.timeframe, self.cfg.mode, self.cfg.version)}: {self.exc}".rstrip())
+
+@dataclass
+class ParallelState:
+    max_parallel: int = MAX_PARALLEL
+    limit: int = 1                  # soft cap that grows only on scheduled checks
+    next_check_at: float = 0.0      # when to run the next periodic check
+    active: Dict[str, Worker] = None
+    start_backoff_until: float = 0.0   # kept for compatibility (unused)
+    last_start_log: float = 0.0        # kept for compatibility (unused)
+
+    def __post_init__(self):
+        if self.active is None:
+            self.active = {}
+
+# --- helpers for queue/build/skip ------------------------------------------------
+
+def build_queue(symbol: str, device: str, data_dir: str, models_dir: str, logs_dir: str,
+                timeframes: List[str], modes: List[str], versions: List[str]) -> List['TrainConfig']:
+    q: List[TrainConfig] = []
+    for tf in timeframes:
+        for mode in modes:
+            for ver in versions:
+                q.append(TrainConfig(
+                    symbol=symbol,
+                    device=device,
+                    timeframe=tf,
+                    mode=mode,
+                    version=ver,
+                    data_dir=data_dir,
+                    models_dir=models_dir,
+                    logs_dir=logs_dir
+                ))
+    return q
+
+def filter_already_trained(queue: List['TrainConfig']) -> Tuple[List['TrainConfig'], int]:
+    kept: List[TrainConfig] = []
+    skipped = 0
+    for cfg in queue:
+        name = model_name(cfg.symbol, cfg.timeframe, cfg.mode, cfg.version)
+        done = read_progress(cfg.logs_dir, name)
+        if done >= TOTAL_TIMESTEPS:
+            skipped += 1
+            continue
+        kept.append(cfg)
+    return kept, skipped
+
+# --- utilization + device choice ------------------------------------------------
+
+def get_gpu_cpu_ram_util() -> float:
+    cpu = psutil.cpu_percent(interval=0.2)/100.0 if psutil else 0.0
+    ram = psutil.virtual_memory().percent/100.0 if psutil else 0.0
+    gpu = get_gpu_utilization()
+    return max(cpu, ram, gpu)
+
+def choose_device_for_job() -> Tuple[Optional[str], float, float]:
+    """
+    Returns ('cuda' or 'cpu', cpu_util, gpu_util) or (None, cpu, gpu) if both >= threshold.
+    Priority: GPU if gpu < threshold; else CPU if cpu < threshold.
+    """
+    cpu, _ram = get_cpu_ram_utilization()
+    gpu = get_gpu_utilization()
+    if gpu < UTIL_THRESHOLD:
+        return "cuda", cpu, gpu
+    if cpu < UTIL_THRESHOLD:
+        return "cpu", cpu, gpu
+    return None, cpu, gpu
+
+# --- periodic scheduler ---------------------------------------------------------
+
+def should_check(now: float, st: ParallelState) -> bool:
+    return now >= st.next_check_at
+
+def schedule_after_ok(st: ParallelState):
+    st.next_check_at = time.time() + CHECK_COOLDOWN_OK
+
+def schedule_after_high(st: ParallelState):
+    st.next_check_at = time.time() + CHECK_COOLDOWN_HIGH
+
+def schedule_first_check(st: ParallelState):
+    # first periodic check in 2 minutes (we still do ONE initial start attempt below)
+    st.next_check_at = time.time() + CHECK_COOLDOWN_OK
+
+def start_one_job(st: ParallelState, queue: List[TrainConfig]) -> bool:
+    if len(st.active) >= min(st.limit, st.max_parallel):
+        return False
+    if not queue:
+        return False
+
+    device, cpu, gpu = choose_device_for_job()
+    if device is None:
+        # over the threshold, cannot start now
+        return False
+
+    cfg = queue.pop(0)
+    cfg = TrainConfig(
+        symbol=cfg.symbol,
+        device=device,  # override per-job device choice
+        timeframe=cfg.timeframe,
+        mode=cfg.mode,
+        version=cfg.version,
+        data_dir=cfg.data_dir,
+        models_dir=cfg.models_dir,
+        logs_dir=cfg.logs_dir
+    )
+    name = model_name(cfg.symbol, cfg.timeframe, cfg.mode, cfg.version)
+    print(f"{ts()} | INFO | [PPO PARALLEL] starting ({len(st.active)+1}/{st.limit}) -> {name} on {device} (cpu={round2(cpu)}, gpu={round2(gpu)}, norm={UTIL_THRESHOLD:.2f})")
+    w = Worker(cfg)
+    st.active[name] = w
+    w.start()
+    return True
+
+def periodic_check_and_maybe_start(st: ParallelState, queue: List[TrainConfig]):
+    """
+    The ONLY recurring check:
+      - if max load < threshold: schedule next in 2 min, increase limit by 1 (up to max) and start up to (limit - active) jobs
+      - else: schedule next in 15 min, do not start anything
+    """
+    cpu, _ram = get_cpu_ram_utilization()
+    gpu = get_gpu_utilization()
+    max_util = max(cpu, gpu)
+
+    print(f"{ts()} | INFO | [PPO PARALLEL] periodic check -> cpu={round2(cpu)} gpu={round2(gpu)} (thr={UTIL_THRESHOLD:.2f}) act={len(st.active)} lim={st.limit} max={st.max_parallel}")
+
+    if max_util < UTIL_THRESHOLD:
+        # schedule next quick check
+        schedule_after_ok(st)
+        # grow soft limit by 1 (bounded)
+        if st.limit < st.max_parallel:
+            st.limit += 1
+        # start up to (limit - active) jobs
+        to_start = max(0, min(st.limit, st.max_parallel) - len(st.active))
+        for _ in range(to_start):
+            if not start_one_job(st, queue):
+                break
+    else:
+        # too busy -> slow cadence
+        schedule_after_high(st)
+
+def sweep_finished(st: ParallelState):
+    finished = []
+    for name, w in list(st.active.items()):
+        if not w.is_alive():
+            finished.append(name)
+            if w.rc == 0:
+                print(f"{ts()} | INFO | [PPO PARALLEL] finished OK -> {name}")
+            else:
+                print(f"{ts()} | INFO | [PPO PARALLEL] finished with ERR (rc={w.rc}) -> {name}")
+    # remove finished from active
+    for name in finished:
+        st.active.pop(name, None)
+    # close parallel slots: decrease limit by number of finished workers
+    if finished:
+        old_lim = st.limit
+        st.limit = max(0, st.limit - len(finished))
+        print(f"{ts()} | INFO | [PPO PARALLEL] slots closed: -{len(finished)} -> limit={st.limit} (was {old_lim}), active={len(st.active)}")
+
+# -----------------------------------------------------------------------------
+# CLI / main
+# -----------------------------------------------------------------------------
+
+@dataclass
+class TrainConfig:
+    symbol: str
+    device: str
+    timeframe: str
+    mode: str
+    version: str
+    data_dir: str
+    models_dir: str
+    logs_dir: str
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbol", required=True)
+    ap.add_argument("--device", choices=["cpu","cuda"], default="cpu")
+    ap.add_argument("--timeframes", default="1d", help="comma-separated, e.g. 1d or 1h,4h,1d")
+    ap.add_argument("--modes", default="long,short", help="long,short or long")
+    ap.add_argument("--versions", default="V1,V2,V3,V4,V5,V6,V7,V8,V9,V10,V11,V12,V13,V14,V15")
+    ap.add_argument("--max-parallel", type=int, default=MAX_PARALLEL)
+    args = ap.parse_args()
+
+    symbol = args.symbol.upper()
+
+    data_dir = os.path.join("test", "data", symbol)
+    models_dir = os.path.join("models", symbol, "PPO")
+    logs_dir   = os.path.join("logs",   symbol, "PPO")
+    ensure_dir(models_dir)
+    ensure_dir(logs_dir)
+
+    print(f"{ts()} | INFO | [PPO] start training: symbol={symbol} device={args.device}")
+
+    timeframes = [s.strip() for s in args.timeframes.split(",") if s.strip()]
+    modes      = [s.strip() for s in args.modes.split(",") if s.strip()]
+    versions   = [s.strip() for s in args.versions.split(",") if s.strip()]
+
+    raw_queue = build_queue(symbol, args.device, data_dir, models_dir, logs_dir, timeframes, modes, versions)
+    queue, skipped = filter_already_trained(raw_queue)
+    if skipped > 0:
+        print(f"{ts()} | INFO | [PPO] skip {skipped} already-trained config(s)")
+
+    st = ParallelState(max_parallel=min(args.max_parallel, MAX_PARALLEL), limit=1)
+    schedule_first_check(st)
+
+    # --- Initial ONE-TIME attempt to start the first job (not a periodic check) ---
+    if queue:
+        device, cpu, gpu = choose_device_for_job()
+        if device is not None:
+            cfg0 = queue.pop(0)
+            cfg0 = TrainConfig(
+                symbol=cfg0.symbol,
+                device=device,
+                timeframe=cfg0.timeframe,
+                mode=cfg0.mode,
+                version=cfg0.version,
+                data_dir=cfg0.data_dir,
+                models_dir=cfg0.models_dir,
+                logs_dir=cfg0.logs_dir
+            )
+            name0 = model_name(cfg0.symbol, cfg0.timeframe, cfg0.mode, cfg0.version)
+            print(f"{ts()} | INFO | [PPO PARALLEL] starting ({len(st.active)+1}/{st.limit}) -> {name0} on {device} (cpu={round2(cpu)}, gpu={round2(gpu)}, norm={UTIL_THRESHOLD:.2f})")
+            w0 = Worker(cfg0)
+            st.active[name0] = w0
+            w0.start()
+
+    # --- Main loop: ONLY periodic scheduled checks + finish sweeping ---
+    while queue or st.active:
+        sweep_finished(st)
+        now = time.time()
+        if should_check(now, st):
+            periodic_check_and_maybe_start(st, queue)
+        time.sleep(0.3)
+
+    print(f"{ts()} | INFO | [PPO] all jobs done.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        try:
+            if _NVML_OK:
+                pynvml.nvmlShutdown()
+        except Exception:
+            pass

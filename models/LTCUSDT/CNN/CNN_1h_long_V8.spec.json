@@ -1,0 +1,13 @@
+{
+  "features": [
+    "macd",
+    "supertrend",
+    "rsi_14"
+  ],
+  "lookback": 64,
+  "target_col": "target_long",
+  "in_channels": 3,
+  "created": "2025-08-15T14:26:54.167575Z",
+  "model_file": "CNN_1h_long_V8.pt",
+  "scaler_file": "CNN_1h_long_V8.scaler.npz"
+}

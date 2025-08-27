@@ -1,0 +1,19 @@
+{
+  "model_name": "LSTM_15m_short_V3",
+  "symbol": "ETHUSDT",
+  "timeframe": "15m",
+  "target": "short",
+  "variant_id": "3",
+  "seq_len": 32,
+  "features": [
+    "macd",
+    "rsi_14"
+  ],
+  "n_features": 2,
+  "preprocessing": {
+    "scaler": "StandardScaler",
+    "with_mean": true,
+    "with_std": true
+  },
+  "seed": 42
+}
