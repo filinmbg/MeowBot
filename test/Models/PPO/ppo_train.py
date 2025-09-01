@@ -70,7 +70,7 @@ except Exception:
 # Config
 # -----------------------------------------------------------------------------
 
-MAX_PARALLEL = 50
+MAX_PARALLEL = 20
 
 # Main threshold (norm) = 70%
 # - below 0.70: it's okay to start more work (2-min cadence)
