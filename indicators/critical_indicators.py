@@ -12,15 +12,25 @@ def add_critical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
+    if "open_time" in df.columns:
+        df = df.sort_values("open_time").reset_index(drop=True)
+
+    # Нормалізуємо типи — уникнемо dtype warning-ів
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
+
     def safe_add(name, func):
         try:
             res = func()
-            if res is not None and not (isinstance(res, pd.DataFrame) and res.empty):
-                if isinstance(res, pd.Series):
-                    df[name] = res
-                elif isinstance(res, pd.DataFrame):
-                    # беремо першу колонку, як і в твоєму пайплайні
-                    df[name] = res.iloc[:, 0]
+            if res is None or (isinstance(res, pd.DataFrame) and res.empty):
+                return
+            s = res.iloc[:, 0] if isinstance(res, pd.DataFrame) else res
+            s = pd.to_numeric(s, errors="coerce").astype("float64")
+            if name in df.columns:
+                df.drop(columns=[name], inplace=True)
+            df[name] = pd.Series(index=df.index, dtype="float64")
+            df.loc[:, name] = s.values
         except Exception as e:
             print(f"[!] {name} failed: {e}")
 
@@ -73,7 +83,8 @@ def add_critical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # === Volume & Flow ===
     safe_add("obv", lambda: ta.obv(df["close"], df["volume"]))
     safe_add("ad", lambda: ta.ad(df["high"], df["low"], df["close"], df["volume"]))
-    safe_add("mfi_14", lambda: ta.mfi(df["high"], df["low"], df["close"], df["volume"], length=14))
+    # важливо: volume у float64, щоб уникнути dtype warning
+    safe_add("mfi_14", lambda: ta.mfi(df["high"], df["low"], df["close"], df["volume"].astype("float64"), length=14))
     try:
         df["rvol_20"] = df["volume"] / df["volume"].rolling(20).mean()
     except Exception:
@@ -96,12 +107,25 @@ def add_critical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except Exception as e:
         print(f"[!] pivot levels failed: {e}")
 
-    # === Heikin Ashi ===
+    # === Heikin Ashi — без pandas_ta.ha (щоб не було chained assignment warning) ===
     try:
-        ha = ta.ha(df["open"], df["high"], df["low"], df["close"])
-        df["ha_open"] = ha["HA_open"]
-        df["ha_close"] = ha["HA_close"]
+        HA_close = (df["open"] + df["high"] + df["low"] + df["close"]) / 4.0
+        HA_open = HA_close.copy()
+        if len(HA_open) > 0:
+            HA_open.iloc[0] = (df["open"].iloc[0] + df["close"].iloc[0]) / 2.0
+            for i in range(1, len(HA_open)):
+                HA_open.iloc[i] = 0.5 * (HA_open.iloc[i - 1] + HA_close.iloc[i - 1])
+        HA_high = pd.concat([df["high"], HA_open, HA_close], axis=1).max(axis=1)
+        HA_low  = pd.concat([df["low"],  HA_open, HA_close], axis=1).min(axis=1)
+
+        # створюємо цільові колонки як float64 і пишемо через .loc
+        for name, series in (("ha_open", HA_open), ("ha_close", HA_close), ("ha_high", HA_high), ("ha_low", HA_low)):
+            if name in df.columns:
+                df.drop(columns=[name], inplace=True)
+            df[name] = pd.Series(index=df.index, dtype="float64")
+            df.loc[:, name] = pd.to_numeric(series, errors="coerce").astype("float64").values
     except Exception:
+        # на випадок, якщо бракує даних — не падаємо
         pass
 
     # === Trend Lines (Up & Down) — як у твоєму пайплайні ===
@@ -169,6 +193,6 @@ def add_critical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except Exception as e:
         print(f"[!] trend line detection failed: {e}")
 
-    # заповнювач
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(method="bfill")
+    # фінальне заповнення без застарілого синтаксису
+    df = df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
     return df

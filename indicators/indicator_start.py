@@ -1,23 +1,29 @@
 import logging
-import pandas as pd
-from typing import List
+from typing import List, Dict, Any
 
-# ✅ використовуємо твій файл indicators.py у корені проєкту
-from indicators import add_critical_indicators
+import pandas as pd
 from database.mongo.connection import get_db
+
+# ✅ коректний імпорт індикаторів із пакета; є fallback на корінь
+try:
+    from indicators.critical_indicators import add_critical_indicators
+except ImportError:
+    from critical_indicators import add_critical_indicators  # якщо файл лежить у корені
 
 log = logging.getLogger("meowbot.indicator_start")
 
+
 async def process_and_save(symbol: str, timeframe: str, bars: List[List[float]]) -> int:
     """
-    bars: список klines від Binance: [open_time, open, high, low, close, volume, close_time, ...]
+    bars: список klines від Binance:
+      [open_time, open, high, low, close, volume, close_time, ...]
     Зберігає лише НОВІ бари (за ключем symbol+timeframe+open_time).
-    Повертає кількість збережених документів.
+    Повертає кількість вставлених документів.
     """
     if not bars:
         return 0
 
-    rows = []
+    rows: List[Dict[str, Any]] = []
     for k in bars:
         rows.append(
             {
@@ -34,6 +40,7 @@ async def process_and_save(symbol: str, timeframe: str, bars: List[List[float]])
         )
 
     df = pd.DataFrame(rows)
+
     # ✅ додаємо саме ті індикатори, що у тренуванні
     df = add_critical_indicators(df)
 
@@ -46,6 +53,7 @@ async def process_and_save(symbol: str, timeframe: str, bars: List[List[float]])
     )
 
     inserted = 0
+    # upsert по одному документу (просто і надійно; за бажанням можна перевести на bulk_write)
     for d in df.to_dict(orient="records"):
         res = await col.update_one(
             {"symbol": d["symbol"], "timeframe": d["timeframe"], "open_time": d["open_time"]},

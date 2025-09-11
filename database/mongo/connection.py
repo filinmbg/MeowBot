@@ -24,20 +24,15 @@ _notified_failure: bool = False  # щоб не спамити адміну пр�
 
 async def init_mongo(
     *,
-    bot=None,                  # telegram.Bot або application.bot
+    bot=None,
     admin_chat_id: Optional[int] = None,
     mongo_uri: Optional[str] = None,
     mongo_db_name: Optional[str] = None,
 ) -> None:
-    """
-    Ініціалізує глобальне підключення до MongoDB (Motor, async).
-    Якщо помилка — один раз надсилає повідомлення адміну (якщо admin_chat_id задано).
-    Інші модулі мають користуватися ТІЛЬКИ get_db()/get_client(), нових клієнтів не створювати.
-    """
     global _client, _db, _inited, _cached_conf, _notified_failure
 
-    if _inited and _client and _db:
-        # Уже ініціалізовано — перевіримо, чи не змінилась конфігурація
+    # ✅ ПОРЯДКОВА ПЕРЕВІРКА — ТІЛЬКИ is not None
+    if _inited and (_client is not None) and (_db is not None):
         if mongo_uri or mongo_db_name:
             current = _cached_conf or ("", "")
             new_conf = (mongo_uri or current[0], mongo_db_name or current[1])
@@ -47,7 +42,6 @@ async def init_mongo(
                 )
         return
 
-    # Завантажимо .env на випадок, якщо ще не завантажений
     load_dotenv()
 
     uri = (mongo_uri or os.getenv("MONGO_URI") or "").strip()
@@ -63,8 +57,6 @@ async def init_mongo(
     try:
         _client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
         _db = _client[dbname]
-
-        # Перевірка реального конекту
         await _db.command("ping")
 
         _cached_conf = (uri, dbname)
@@ -89,6 +81,7 @@ async def init_mongo(
             "⚠️ Не вдалося підключитися до MongoDB. Перевірте MONGO_URI/MONGO_DB_NAME та доступ.\n"
             f"Технічні деталі: <code>{type(e).__name__}: {str(e)}</code>",
         )
+
 
 
 def is_connected() -> bool:
