@@ -1,0 +1,21 @@
+{
+  "model_name": "XGB_1d_long_V4",
+  "symbol": "BTCUSDT",
+  "timeframe": "1d",
+  "target": "long",
+  "variant_id": "4",
+  "seq_len": null,
+  "features": [
+    "macd",
+    "bb_upper",
+    "bb_middle",
+    "bb_lower"
+  ],
+  "n_features": 4,
+  "preprocessing": {
+    "scaler": null,
+    "with_mean": false,
+    "with_std": false
+  },
+  "seed": 42
+}

@@ -1,0 +1,19 @@
+{
+  "model_name": "XGB_1h_long_V2",
+  "symbol": "BTCUSDT",
+  "timeframe": "1h",
+  "target": "long",
+  "variant_id": "2",
+  "seq_len": null,
+  "features": [
+    "macd",
+    "ema_20"
+  ],
+  "n_features": 2,
+  "preprocessing": {
+    "scaler": null,
+    "with_mean": false,
+    "with_std": false
+  },
+  "seed": 42
+}

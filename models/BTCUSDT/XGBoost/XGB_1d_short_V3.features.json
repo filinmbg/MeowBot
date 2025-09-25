@@ -1,0 +1,19 @@
+{
+  "model_name": "XGB_1d_short_V3",
+  "symbol": "BTCUSDT",
+  "timeframe": "1d",
+  "target": "short",
+  "variant_id": "3",
+  "seq_len": null,
+  "features": [
+    "macd",
+    "rsi_14"
+  ],
+  "n_features": 2,
+  "preprocessing": {
+    "scaler": null,
+    "with_mean": false,
+    "with_std": false
+  },
+  "seed": 42
+}
