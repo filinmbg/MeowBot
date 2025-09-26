@@ -1,0 +1,33 @@
+{
+  "features": [
+    "macd",
+    "supertrend",
+    "ema_20",
+    "rsi_14",
+    "bb_upper",
+    "bb_middle",
+    "bb_lower",
+    "mfi_14",
+    "obv",
+    "trend_up_valid",
+    "trend_up_slope",
+    "trend_up_confirmed",
+    "trend_up_angle_deg",
+    "trend_up_distance",
+    "trend_up_break_above",
+    "trend_up_break_below",
+    "trend_down_valid",
+    "trend_down_slope",
+    "trend_down_confirmed",
+    "trend_down_angle_deg",
+    "trend_down_distance",
+    "trend_down_break_above",
+    "trend_down_break_below"
+  ],
+  "lookback": 64,
+  "target_col": "target_long",
+  "in_channels": 23,
+  "created": "2025-08-17T08:24:03.517202Z",
+  "model_file": "CNN_30m_long_V13.pt",
+  "scaler_file": "CNN_30m_long_V13.scaler.npz"
+}

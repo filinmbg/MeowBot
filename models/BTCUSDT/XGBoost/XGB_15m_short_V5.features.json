@@ -1,0 +1,20 @@
+{
+  "model_name": "XGB_15m_short_V5",
+  "symbol": "BTCUSDT",
+  "timeframe": "15m",
+  "target": "short",
+  "variant_id": "5",
+  "seq_len": null,
+  "features": [
+    "macd",
+    "ema_20",
+    "rsi_14"
+  ],
+  "n_features": 3,
+  "preprocessing": {
+    "scaler": null,
+    "with_mean": false,
+    "with_std": false
+  },
+  "seed": 42
+}

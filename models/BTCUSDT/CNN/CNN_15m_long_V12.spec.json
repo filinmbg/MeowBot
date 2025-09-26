@@ -1,0 +1,19 @@
+{
+  "features": [
+    "macd",
+    "supertrend",
+    "ema_20",
+    "rsi_14",
+    "bb_upper",
+    "bb_middle",
+    "bb_lower",
+    "mfi_14",
+    "obv"
+  ],
+  "lookback": 64,
+  "target_col": "target_long",
+  "in_channels": 9,
+  "created": "2025-08-15T14:58:43.138574Z",
+  "model_file": "CNN_15m_long_V12.pt",
+  "scaler_file": "CNN_15m_long_V12.scaler.npz"
+}
