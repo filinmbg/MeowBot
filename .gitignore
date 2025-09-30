@@ -3,6 +3,7 @@ venv/
 
 # Папка з навчанням
 test/data
+backtest/data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
