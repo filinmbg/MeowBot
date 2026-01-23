@@ -7,7 +7,7 @@ import torch
 from model import CNNLSTMClassifier
 from config import CONFIG
 
-MODEL_DIR = "Models/CNN"
+MODEL_DIR = "mmodels/CNN"
 TEST_CSV = "test/data/BTCUSDT/BTCUSDT_1m_indicators.csv"
 START_DATE = "2022-01-01"
 SEQ_LEN = 30

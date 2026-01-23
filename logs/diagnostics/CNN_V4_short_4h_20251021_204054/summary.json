@@ -1,0 +1,17 @@
+{
+  "symbol": "BTCUSDT",
+  "timeframe": "4h",
+  "family": "CNN",
+  "variant": "V4",
+  "side": "short",
+  "total_rows": 17831,
+  "counts": {
+    "none_features_missing": 0,
+    "none_model_issue": 0,
+    "none_other_error": 0,
+    "none_below_threshold": 0,
+    "opposite_side": 17831
+  },
+  "threshold": 0.5,
+  "feat_order_len": 4
+}

@@ -1,0 +1,37 @@
+{
+  "model_name": "XGB_30m_short_V14",
+  "symbol": "BTCUSDT",
+  "timeframe": "30m",
+  "target": "short",
+  "variant_id": "14",
+  "seq_len": null,
+  "features": [
+    "macd",
+    "supertrend",
+    "ema_20",
+    "rsi_14",
+    "bb_upper",
+    "bb_middle",
+    "bb_lower",
+    "mfi_14",
+    "obv",
+    "trend_up_valid",
+    "trend_up_slope",
+    "trend_up_confirmed",
+    "trend_down_valid",
+    "trend_down_slope",
+    "trend_down_confirmed",
+    "pivot",
+    "r1",
+    "s1",
+    "r2",
+    "s2"
+  ],
+  "n_features": 20,
+  "preprocessing": {
+    "scaler": null,
+    "with_mean": false,
+    "with_std": false
+  },
+  "seed": 42
+}

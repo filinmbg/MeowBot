@@ -1,0 +1,17 @@
+{
+  "symbol": "BTCUSDT",
+  "timeframe": "15m",
+  "family": "LSTM",
+  "variant": "V2",
+  "side": "short",
+  "total_rows": 284976,
+  "counts": {
+    "none_features_missing": 0,
+    "none_model_issue": 0,
+    "none_other_error": 0,
+    "none_below_threshold": 0,
+    "opposite_side": 284976
+  },
+  "threshold": 0.5,
+  "feat_order_len": 2
+}

@@ -1,0 +1,20 @@
+{
+  "model_name": "QL_1h_long_V8",
+  "symbol": "BTCUSDT",
+  "timeframe": "1h",
+  "target": "long",
+  "variant_id": "8",
+  "seq_len": 32,
+  "features": [
+    "macd",
+    "supertrend",
+    "rsi_14"
+  ],
+  "n_features": 3,
+  "preprocessing": {
+    "scaler": "StandardScaler",
+    "with_mean": true,
+    "with_std": true
+  },
+  "seed": 42
+}
