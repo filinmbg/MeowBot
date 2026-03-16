@@ -30,30 +30,39 @@ class Signal:
 
 
 @dataclass
+@dataclass
 class Trade:
     trade_id: str
+    user_id: str
     symbol: str
     side: Side
     status: TradeStatus
 
-    opened_at: int   # ms
+    opened_at: int
     entry_price: float
     qty: float
+
     leverage: int
     stake_usd: float
 
     tf_entry: str
     model_id: str
-    entry_bar_close_time: int  # close_time бару, на якому відкрили трейд
+    entry_bar_close_time: int
 
-    # Exit state
     sl_price: float
+
+    # поля з дефолтами — тільки нижче
+    mode: str = "sandbox"
     tp_hit_count: int = 0
     remaining_pct: float = 1.0
-    exit_last_check_at: int = 0  # ms (1m close time processed)
+    exit_last_check_at: int = 0
 
-    # Close info
+    qty_remaining: Optional[float] = None
     closed_at: Optional[int] = None
     close_price: Optional[float] = None
     exit_reason: Optional[str] = None
     realized_pnl_usd: float = 0.0
+
+    def __post_init__(self):
+        if self.qty_remaining is None:
+            self.qty_remaining = self.qty

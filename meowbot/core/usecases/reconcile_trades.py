@@ -1,81 +1,170 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Optional, List
+import logging
 
-from meowbot.core.domain.types import Trade, Bar
-from meowbot.core.domain.enums import Side
+from meowbot.core.domain.types import Bar
 from meowbot.core.ports.trades_repo import TradesRepository
 from meowbot.core.ports.exchange_market_data import ExchangeMarketData
+from meowbot.core.ports.broker import Broker
+from meowbot.core.ports.trade_events_repo import TradeEventsRepository
+from meowbot.core.services.execution.exit.tp_sl_cascade import apply_tp_sl_cascade
+
+log = logging.getLogger("meowbot")
 
 
 def floor_to_1m(ts_ms: int) -> int:
     return ts_ms - (ts_ms % 60_000)
 
 
-def calc_pnl_usd(side: Side, entry: float, close: float, qty: float, leverage: int) -> float:
-    # дуже спрощено: pnl = (delta * qty) * leverage
-    # комісії поки ігноруємо (тут тест пайплайна)
-    if side == Side.LONG:
-        return (close - entry) * qty * leverage
-    else:
-        return (entry - close) * qty * leverage
+def _side_value(side: object) -> str:
+    return side.value if hasattr(side, "value") else str(side)
+
+
+def _status_value(status: object) -> str:
+    return status.value if hasattr(status, "value") else str(status)
+
+
+def _move_pct(side: object, entry_price: float, current_price: float) -> float:
+    if entry_price == 0:
+        return 0.0
+
+    sv = _side_value(side)
+    if sv == "LONG":
+        return ((current_price - entry_price) / entry_price) * 100.0
+    return ((entry_price - current_price) / entry_price) * 100.0
 
 
 class ReconcileOpenTradesUseCase:
-    """
-    Бере всі OPEN trades, доганяє їх 1m барами з біржі і робить простий exit по SL.
-    """
-
-    def __init__(self, trades_repo: TradesRepository, exchange: ExchangeMarketData):
+    def __init__(
+        self,
+        trades_repo: TradesRepository,
+        exchange: ExchangeMarketData,
+        broker: Broker,
+        trade_events_repo: TradeEventsRepository | None = None,
+    ):
         self.trades_repo = trades_repo
         self.exchange = exchange
+        self.broker = broker
+        self.trade_events_repo = trade_events_repo
 
     def run(self, now_ms: int) -> None:
         end = floor_to_1m(now_ms)
         open_trades = self.trades_repo.get_open_trades()
 
+        log.info("[exit] open_trades=%d end=%s", len(open_trades), end)
+
         for trade in open_trades:
-            start = trade.exit_last_check_at
-            if start >= end:
-                continue
-
-            m1_bars: List[Bar] = self.exchange.fetch_klines(trade.symbol, "1m", start, end)
-            if not m1_bars:
-                # навіть якщо барів нема — оновимо курсор, щоб не зациклюватись
-                trade.exit_last_check_at = end
-                self.trades_repo.update_trade(trade)
-                continue
-
-            closed = False
-            close_price: Optional[float] = None
-            close_ts: Optional[int] = None
-
-            # Простий SL:
-            # LONG: якщо low <= sl_price -> close
-            # SHORT: якщо high >= sl_price -> close
-            for b in m1_bars:
-                if trade.side == Side.LONG and b.l <= trade.sl_price:
-                    closed = True
-                    close_price = trade.sl_price
-                    close_ts = b.close_time
-                    break
-                if trade.side == Side.SHORT and b.h >= trade.sl_price:
-                    closed = True
-                    close_price = trade.sl_price
-                    close_ts = b.close_time
-                    break
-
-            if closed and close_price is not None and close_ts is not None:
-                pnl = calc_pnl_usd(trade.side, trade.entry_price, close_price, trade.qty, trade.leverage)
-                self.trades_repo.close_trade(
-                    trade_id=trade.trade_id,
-                    closed_at=close_ts,
-                    close_price=close_price,
-                    reason="SL_HIT",
-                    pnl_usd=pnl,
+            processed_until = trade.exit_last_check_at
+            if processed_until >= end:
+                log.info(
+                    "[exit] trade_id=%s symbol=%s: skip (processed_until=%s >= end=%s)",
+                    trade.trade_id,
+                    trade.symbol,
+                    processed_until,
+                    end,
                 )
-            else:
-                # не закрились — просто оновлюємо курсор до end
+                continue
+
+            fetch_start = max(0, processed_until - 5 * 60_000)
+
+            log.info(
+                "[exit] trade_id=%s symbol=%s: raw fetch from %s to %s",
+                trade.trade_id,
+                trade.symbol,
+                fetch_start,
+                end,
+            )
+
+            raw_bars: list[Bar] = self.exchange.fetch_klines(trade.symbol, "1m", fetch_start, end)
+
+            log.info(
+                "[exit] trade_id=%s symbol=%s: fetched %d raw bars",
+                trade.trade_id,
+                trade.symbol,
+                len(raw_bars),
+            )
+
+            m1_bars = [
+                b for b in raw_bars
+                if processed_until < b.close_time <= end
+            ]
+            m1_bars.sort(key=lambda x: x.close_time)
+
+            log.info(
+                "[exit] trade_id=%s symbol=%s: %d filtered bars to process",
+                trade.trade_id,
+                trade.symbol,
+                len(m1_bars),
+            )
+
+            if not m1_bars:
                 trade.exit_last_check_at = end
                 self.trades_repo.update_trade(trade)
+
+                log.info(
+                    "[exit] %s trade_id=%s entry=%.4f now=%.4f move=%+.3f%% sl=%.4f tp_hit_count=%s qty_remaining=%.8f | no new filtered bars, cursor -> %s",
+                    trade.symbol,
+                    trade.trade_id,
+                    trade.entry_price,
+                    trade.entry_price,
+                    0.0,
+                    trade.sl_price,
+                    trade.tp_hit_count,
+                    trade.qty_remaining,
+                    end,
+                )
+                continue
+
+            last_bar = m1_bars[-1]
+            current_price = float(last_bar.c)
+            move_pct_before = _move_pct(trade.side, trade.entry_price, current_price)
+
+            log.info(
+                "[exit] %s trade_id=%s entry=%.4f now=%.4f move=%+.3f%% sl=%.4f tp_hit_count=%s qty_remaining=%.8f",
+                trade.symbol,
+                trade.trade_id,
+                trade.entry_price,
+                current_price,
+                move_pct_before,
+                trade.sl_price,
+                trade.tp_hit_count,
+                trade.qty_remaining,
+            )
+
+            updated = apply_tp_sl_cascade(
+                trade,
+                m1_bars,
+                self.broker,
+                self.trade_events_repo,
+            )
+            updated.exit_last_check_at = end
+            self.trades_repo.update_trade(updated)
+
+            status_value = _status_value(updated.status)
+            close_or_now = updated.close_price if updated.close_price is not None else current_price
+            move_pct_after = _move_pct(updated.side, updated.entry_price, float(close_or_now))
+
+            log.info(
+                "[exit] %s trade_id=%s status=%s entry=%.4f now=%.4f move=%+.3f%% sl=%.4f tp_hit_count=%s qty_remaining=%.8f realized_pnl=%.6f",
+                updated.symbol,
+                updated.trade_id,
+                status_value,
+                updated.entry_price,
+                float(close_or_now),
+                move_pct_after,
+                updated.sl_price,
+                updated.tp_hit_count,
+                updated.qty_remaining,
+                updated.realized_pnl_usd,
+            )
+
+            if status_value == "CLOSED":
+                log.info(
+                    "[exit] %s trade_id=%s CLOSED reason=%s close_price=%.4f total_move=%+.3f%% realized_pnl=%.6f",
+                    updated.symbol,
+                    updated.trade_id,
+                    updated.exit_reason,
+                    float(updated.close_price),
+                    move_pct_after,
+                    updated.realized_pnl_usd,
+                )

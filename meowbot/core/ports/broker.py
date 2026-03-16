@@ -1,17 +1,30 @@
 from __future__ import annotations
 
-from typing import Protocol, Any, Dict
+from typing import Protocol
 
-from ..domain.types import Trade
+from meowbot.core.domain.types import Trade
 
 
 class Broker(Protocol):
     def ping(self) -> bool:
         ...
 
-    def open_trade(self, trade: Trade) -> Trade:
-        """Paper/live: може повернути trade з фактичними qty/price."""
+    def open_position(self, trade: Trade) -> Trade:
+        """
+        Відкрити позицію.
+        Для sandbox просто повертає trade.
+        Для futures/spot потім буде реальний ордер.
+        """
         ...
 
-    def close_trade(self, trade: Trade) -> Trade:
+    def reduce_position(self, trade: Trade, qty_to_reduce: float, price: float, reason: str) -> Trade:
+        """
+        Частково зменшити позицію.
+        """
+        ...
+
+    def close_position(self, trade: Trade, price: float, reason: str) -> Trade:
+        """
+        Повністю закрити позицію.
+        """
         ...

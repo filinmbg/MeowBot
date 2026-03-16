@@ -3,7 +3,7 @@ from meowbot.core.domain.enums import Side, TradeStatus
 from meowbot.core.usecases.reconcile_trades import ReconcileOpenTradesUseCase, floor_to_1m
 from meowbot.infra.memory.trades_repo import InMemoryTradesRepo
 from meowbot.infra.memory.exchange import FakeExchange
-
+from meowbot.infra.broker.paper import PaperBroker
 
 def make_m1_bar(i: int, low: float, high: float, close: float) -> Bar:
     # 1m бар: open_time=i*60_000, close_time=(i+1)*60_000
@@ -25,9 +25,9 @@ def make_m1_bar(i: int, low: float, high: float, close: float) -> Bar:
 def test_trade_closes_on_sl_long():
     # Бар 2 пробиває SL по low
     ex_bars = [
-        make_m1_bar(0, low=100, high=102, close=101),
-        make_m1_bar(1, low=99, high=101, close=100),
-        make_m1_bar(2, low=95, high=100, close=98),  # SL=97 -> hit
+        make_m1_bar(0, low=100, high=100.4, close=100.2),
+        make_m1_bar(1, low=99, high=100.3, close=100.0),
+        make_m1_bar(2, low=95, high=100.2, close=98),
     ]
     exchange = FakeExchange(ex_bars)
 
@@ -35,6 +35,8 @@ def test_trade_closes_on_sl_long():
     repo.create_trade(
         Trade(
             trade_id="t1",
+            user_id="u1",
+            mode="sandbox",
             symbol="BTCUSDT",
             side=Side.LONG,
             status=TradeStatus.OPEN,
@@ -48,10 +50,12 @@ def test_trade_closes_on_sl_long():
             entry_bar_close_time=0,
             sl_price=97.0,
             exit_last_check_at=0,
+
         )
     )
 
-    uc = ReconcileOpenTradesUseCase(repo, exchange)
+    broker = PaperBroker()
+    uc = ReconcileOpenTradesUseCase(repo, exchange, broker)
     uc.run(now_ms=3 * 60_000 + 10_000)  # трошки після 3х хвилин
 
     t = repo.get_open_trade_by_symbol("BTCUSDT")
@@ -67,16 +71,17 @@ def test_trade_closes_on_sl_long():
 def test_trade_not_processed_twice():
     # SL не чіпаємо, просто курсор має рухатись вперед
     ex_bars = [
-        make_m1_bar(0, low=100, high=102, close=101),
-        make_m1_bar(1, low=100, high=102, close=101),
-        make_m1_bar(2, low=100, high=102, close=101),
-        make_m1_bar(3, low=100, high=102, close=101),
+        make_m1_bar(0, low=100.0, high=100.4, close=100.2),
+        make_m1_bar(1, low=100.0, high=100.4, close=100.2),
+        make_m1_bar(2, low=100.0, high=100.4, close=100.2),
+        make_m1_bar(3, low=100.0, high=100.4, close=100.2),
     ]
     exchange = FakeExchange(ex_bars)
     repo = InMemoryTradesRepo()
 
     trade = Trade(
         trade_id="t2",
+        user_id="u1",
         symbol="BTCUSDT",
         side=Side.LONG,
         status=TradeStatus.OPEN,
@@ -94,7 +99,8 @@ def test_trade_not_processed_twice():
     )
     repo.create_trade(trade)
 
-    uc = ReconcileOpenTradesUseCase(repo, exchange)
+    broker = PaperBroker()
+    uc = ReconcileOpenTradesUseCase(repo, exchange, broker)
 
     now1 = 4 * 60_000 + 5_000
     uc.run(now_ms=now1)

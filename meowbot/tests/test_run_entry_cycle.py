@@ -7,6 +7,10 @@ from meowbot.core.services.execution.entry.portfolio_gate import PortfolioGate
 from meowbot.infra.memory.bars_repo import InMemoryBarsRepo
 from meowbot.infra.memory.trades_repo import InMemoryTradesRepo
 from meowbot.infra.memory.broker import InMemoryBroker
+from meowbot.infra.memory.account_repo import InMemoryAccountRepo
+from meowbot.core.services.execution.risk.sizing import PositionSizing
+from meowbot.infra.memory.policy import FakeThresholdPolicy
+from meowbot.core.services.execution.entry.policy_entry_strategy import PolicyEntryStrategy
 
 
 class ThresholdLongStrategy:
@@ -143,3 +147,67 @@ def test_no_duplicate_entry_on_same_bar():
     # 2-й виклик на тому ж барі — має НЕ відкрити (антидубль)
     tid2 = uc.run(symbol="BTCUSDT", tf="15m", now_ms=2000, sl_price=100.0)
     assert tid2 is None
+
+
+def test_entry_auto_sizing_from_equity():
+    # last bar close = 110 => qty = (equity*0.01*20)/110 = (100*0.01*20)/110 = 20/110
+    bars = [make_bar(0, 110)]
+    repo_bars = InMemoryBarsRepo()
+    repo_bars.upsert_many(bars)
+
+    repo_trades = InMemoryTradesRepo()
+    broker = InMemoryBroker()
+    strategy = ThresholdLongStrategy(threshold=100)
+    gate = PortfolioGate(repo_trades)
+
+    account = InMemoryAccountRepo(equity_usd=100.0)
+    sizing = PositionSizing(stake_pct=0.01, leverage=20)
+
+    uc = RunEntryCycleUseCase(
+        bars_repo=repo_bars,
+        trades_repo=repo_trades,
+        broker=broker,
+        entry_strategy=strategy,
+        gate=gate,
+        features_ver="v1",
+        account_repo=account,
+        sizing=sizing,
+    )
+
+    tid = uc.run(symbol="BTCUSDT", tf="15m", now_ms=1000, sl_price=100.0)
+    assert tid is not None
+
+    t = repo_trades._trades[tid]
+    assert abs(t.stake_usd - 1.0) < 1e-9
+    assert t.leverage == 20
+    assert abs(t.qty - (20.0 / 110.0)) < 1e-9
+
+
+def test_run_entry_cycle_with_policy():
+    # close=120 > threshold=100 => LONG
+    bars = [make_bar(0, 120)]
+    repo_bars = InMemoryBarsRepo()
+    repo_bars.upsert_many(bars)
+
+    repo_trades = InMemoryTradesRepo()
+    broker = InMemoryBroker()
+
+    policy = FakeThresholdPolicy(threshold=100)
+    strategy = PolicyEntryStrategy(policy)
+    gate = PortfolioGate(repo_trades)
+
+    uc = RunEntryCycleUseCase(
+        bars_repo=repo_bars,
+        trades_repo=repo_trades,
+        broker=broker,
+        entry_strategy=strategy,
+        gate=gate,
+        features_ver="v1",
+    )
+
+    tid = uc.run(symbol="BTCUSDT", tf="15m", now_ms=1000, sl_price=100.0)
+    assert tid is not None
+
+    t = repo_trades.get_open_trade_by_symbol("BTCUSDT")
+    assert t is not None
+    assert t.entry_price == 120

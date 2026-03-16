@@ -6,3 +6,6 @@ requires-python = ">=3.10"
 [tool.pytest.ini_options]
 testpaths = ["meowbot/tests"]
 pythonpath = ["."]
+markers = [
+    "integration: integration tests"
+]

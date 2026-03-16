@@ -10,6 +10,8 @@ from meowbot.core.ports.trades_repo import TradesRepository
 from meowbot.core.ports.entry_strategy import EntryStrategy
 from meowbot.core.ports.broker import Broker
 from meowbot.core.services.execution.entry.portfolio_gate import PortfolioGate
+from meowbot.core.ports.account_repo import AccountRepository
+from meowbot.core.services.execution.risk.sizing import PositionSizing
 
 
 class RunEntryCycleUseCase:
@@ -21,6 +23,8 @@ class RunEntryCycleUseCase:
         entry_strategy: EntryStrategy,
         gate: PortfolioGate,
         features_ver: str,
+        account_repo: AccountRepository | None = None,   # ← додали
+        sizing: PositionSizing | None = None,            # ← додали
         tail_needed: int = 1,
     ):
         self.bars_repo = bars_repo
@@ -29,8 +33,9 @@ class RunEntryCycleUseCase:
         self.entry_strategy = entry_strategy
         self.gate = gate
         self.features_ver = features_ver
+        self.account_repo = account_repo                # ← додали
+        self.sizing = sizing                            # ← додали
         self.tail_needed = tail_needed
-
     def run(
         self,
         symbol: str,
@@ -69,8 +74,15 @@ class RunEntryCycleUseCase:
         else:
             return None
 
+        if self.account_repo and self.sizing:
+            equity = self.account_repo.get_equity_usd()
+            stake_usd = self.sizing.stake_usd(equity)
+            leverage = self.sizing.leverage
+            qty = self.sizing.qty_from_price(equity, last_bar.c)
+
         trade = Trade(
             trade_id=f"{symbol}_{tf}_{last_bar.close_time}",
+            user_id="demo_user",
             symbol=symbol,
             side=side,
             status=TradeStatus.OPEN,

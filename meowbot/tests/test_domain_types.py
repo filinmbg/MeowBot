@@ -28,6 +28,8 @@ def test_bar_is_frozen():
 def test_trade_defaults():
     t = Trade(
         trade_id="t1",
+        user_id="u1",
+        mode="sandbox",
         symbol="BTCUSDT",
         side=Side.LONG,
         status=TradeStatus.OPEN,
