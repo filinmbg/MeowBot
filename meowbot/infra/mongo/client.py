@@ -2,15 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
-
+import os
 from pymongo import MongoClient
 from pymongo.database import Database
 
 
+
 @dataclass(frozen=True)
 class MongoConfig:
-    uri: str = "mongodb://localhost:27017"
-    db_name: str = "meowbot"
+    uri: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+    db_name: str = os.getenv("MONGO_DB", "meowbot")
     app_name: str = "MeowBot"
 
 

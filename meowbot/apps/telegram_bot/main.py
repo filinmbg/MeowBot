@@ -7,7 +7,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from dotenv import load_dotenv
 
-from meowbot.apps.bot_online.handlers_start import router as start_router
+from meowbot.apps.telegram_bot.handlers_start import router as start_router
 from meowbot.infra.mongo.client import MongoConn, MongoConfig
 from meowbot.infra.postgres.client import get_pg_pool
 
@@ -31,13 +31,14 @@ async def main() -> None:
 
     dp.include_router(start_router)
 
-    # app_context прокинемо в bot instance
-    bot["app_context"] = {
-        "pg_pool": pg_pool,
-        "mongo": mongo,
-    }
+    dp.workflow_data.update(
+        {
+            "pg_pool": pg_pool,
+            "mongo": mongo,
+        }
+    )
 
-    print("✅ Bot started")
+    print("✅ Telegram bot started")
     print("✅ Postgres connected")
     print("✅ Mongo connected")
 
