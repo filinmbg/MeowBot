@@ -4,40 +4,99 @@ from aiogram import Router
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
-from meowbot.apps.bot_online.bootstrap import build_get_or_create_user_by_telegram_usecase
+from meowbot.apps.telegram_bot.keyboards.main_menu import (
+    build_main_menu_keyboard,
+    build_onboarding_keyboard,
+)
 
 
 router = Router()
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    app = message.bot.get("app_context")
-    pg_pool = app["pg_pool"]
+WELCOME_TEXT = (
+    "🐾 <b>Ласкаво просимо в BotMeow</b>\n\n"
+    "Це бот для контролю торгового бота, статистики, трейдів і налаштувань.\n\n"
+    "Для початку натисни кнопку <b>«🚀 Старт»</b>."
+)
 
-    tg_user = message.from_user
-    if tg_user is None:
-        await message.answer("Не вдалося визначити Telegram-користувача.")
+TUTORIAL_TEXT = (
+    "📘 <b>Короткий туторіал</b>\n\n"
+    "Ось що ти побачиш у меню:\n\n"
+    "🤖 <b>Мій бот</b> — статус бота, режим роботи, швидкий запуск\n"
+    "📊 <b>Статистика</b> — результати торгівлі\n"
+    "📈 <b>Трейди</b> — відкриті та останні закриті угоди\n"
+    "⚙️ <b>Налаштування</b> — параметри бота\n"
+    "👤 <b>Профіль</b> — інформація про акаунт\n"
+    "❓ <b>Допомога</b> — підказки та пояснення\n\n"
+    "Головне меню тепер буде доступне знизу постійно."
+)
+
+MAIN_MENU_TEXT = (
+    "🏠 <b>Головне меню</b>\n\n"
+    "Оберіть потрібний розділ кнопками знизу."
+)
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, telegram_users_repo) -> None:
+    user = message.from_user
+    chat = message.chat
+
+    if user is None:
+        await message.answer("Не вдалося визначити користувача.")
         return
 
-    usecase = build_get_or_create_user_by_telegram_usecase(pg_pool)
-
-    user, is_new_user = await usecase.execute(
-        telegram_user_id=tg_user.id,
-        username=tg_user.username,
-        first_name=tg_user.first_name,
-        last_name=tg_user.last_name,
-        language_code=tg_user.language_code or "uk",
+    await telegram_users_repo.upsert_user(
+        telegram_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        chat_id=chat.id,
     )
 
-    if is_new_user:
+    is_onboarded = await telegram_users_repo.is_onboarded(user.id)
+
+    if not is_onboarded:
         await message.answer(
-            f"Привіт, {user.get('first_name') or user.get('display_name') or 'друже'}! "
-            f"Твій акаунт створено ✅\n"
-            f"user_id: {user['id']}"
+            WELCOME_TEXT,
+            parse_mode="HTML",
+            reply_markup=build_onboarding_keyboard(),
         )
-    else:
-        await message.answer(
-            f"З поверненням, {user.get('first_name') or user.get('display_name') or 'друже'} 👋\n"
-            f"user_id: {user['id']}"
-        )
+        return
+
+    await message.answer(
+        MAIN_MENU_TEXT,
+        parse_mode="HTML",
+        reply_markup=build_main_menu_keyboard(),
+    )
+
+
+@router.message(lambda m: (m.text or "").strip() == "🚀 Старт")
+async def onboarding_start(message: Message, telegram_users_repo) -> None:
+    user = message.from_user
+    if user is None:
+        await message.answer("Не вдалося визначити користувача.")
+        return
+
+    await telegram_users_repo.mark_onboarded(user.id)
+
+    await message.answer(
+        TUTORIAL_TEXT,
+        parse_mode="HTML",
+        reply_markup=build_main_menu_keyboard(),
+    )
+
+    await message.answer(
+        MAIN_MENU_TEXT,
+        parse_mode="HTML",
+        reply_markup=build_main_menu_keyboard(),
+    )
+
+
+@router.message(lambda m: (m.text or "").strip() in {"🏠 Меню", "Меню"})
+async def show_main_menu(message: Message) -> None:
+    await message.answer(
+        MAIN_MENU_TEXT,
+        parse_mode="HTML",
+        reply_markup=build_main_menu_keyboard(),
+    )

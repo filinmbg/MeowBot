@@ -51,7 +51,10 @@ class ReconcileOpenTradesUseCase:
         end = floor_to_1m(now_ms)
         open_trades = self.trades_repo.get_open_trades()
 
-        log.info("[exit] open_trades=%d end=%s", len(open_trades), end)
+        if open_trades:
+            log.info("[exit] open_trades=%d end=%s", len(open_trades), end)
+        else:
+            log.debug("[exit] open_trades=0 end=%s", end)
 
         for trade in open_trades:
             processed_until = trade.exit_last_check_at

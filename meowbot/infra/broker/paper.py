@@ -18,13 +18,15 @@ class PaperBroker:
         qty_to_reduce = min(qty_to_reduce, trade.qty_remaining)
         new_qty_remaining = trade.qty_remaining - qty_to_reduce
 
-        # дуже спрощений pnl, потім зробимо окремо нормальний futures pnl
         side_value = trade.side.value if hasattr(trade.side, "value") else str(trade.side)
 
+        # ВАЖЛИВО:
+        # leverage тут більше НЕ множимо вдруге.
+        # Він уже врахований у qty під час відкриття позиції.
         if side_value == "LONG":
-            pnl = (price - trade.entry_price) * qty_to_reduce * trade.leverage
+            pnl = (price - trade.entry_price) * qty_to_reduce
         else:
-            pnl = (trade.entry_price - price) * qty_to_reduce * trade.leverage
+            pnl = (trade.entry_price - price) * qty_to_reduce
 
         return replace(
             trade,
@@ -37,10 +39,12 @@ class PaperBroker:
     def close_position(self, trade: Trade, price: float, reason: str) -> Trade:
         side_value = trade.side.value if hasattr(trade.side, "value") else str(trade.side)
 
+        # ВАЖЛИВО:
+        # leverage тут більше НЕ множимо вдруге.
         if side_value == "LONG":
-            pnl = (price - trade.entry_price) * trade.qty_remaining * trade.leverage
+            pnl = (price - trade.entry_price) * trade.qty_remaining
         else:
-            pnl = (trade.entry_price - price) * trade.qty_remaining * trade.leverage
+            pnl = (trade.entry_price - price) * trade.qty_remaining
 
         return replace(
             trade,

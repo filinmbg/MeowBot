@@ -1,57 +1,65 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
 import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+from fastapi import Request
 from pymongo import MongoClient
 from pymongo.database import Database
 
+
+load_dotenv()
 
 
 @dataclass(frozen=True)
 class MongoConfig:
     uri: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-    db_name: str = os.getenv("MONGO_DB", "meowbot")
-    app_name: str = "MeowBot"
+    db_name: str = os.getenv("MONGO_DB_NAME", "meowbot")
 
 
 class MongoConn:
-    """
-    Мінімальний thin-wrapper, щоб зручно використовувати в infra/repos.
-    """
-    def __init__(self, cfg: MongoConfig):
-        self.cfg = cfg
-        self._client: Optional[MongoClient] = None
-        self._db: Optional[Database] = None
+    def __init__(self, config: MongoConfig):
+        self.config = config
+        self.client: MongoClient | None = None
+        self.db: Database | None = None
 
     def connect(self) -> None:
-        if self._client is not None:
+        if self.client is not None and self.db is not None:
             return
-        # serverSelectionTimeoutMS: щоб ping не висів довго, якщо Mongo нема
-        self._client = MongoClient(
-            self.cfg.uri,
-            appname=self.cfg.app_name,
-            serverSelectionTimeoutMS=1500,
-        )
-        self._db = self._client[self.cfg.db_name]
 
-    @property
-    def db(self) -> Database:
-        if self._db is None:
-            self.connect()
-        assert self._db is not None
-        return self._db
+        self.client = MongoClient(
+            self.config.uri,
+            serverSelectionTimeoutMS=5000,
+        )
+        self.client.admin.command("ping")
+        self.db = self.client[self.config.db_name]
+
+    def close(self) -> None:
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+            self.db = None
 
     def ping(self) -> bool:
         try:
-            self.connect()
-            self.db.command("ping")
+            if self.client is None:
+                return False
+            self.client.admin.command("ping")
             return True
         except Exception:
             return False
 
-    def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-        self._client = None
-        self._db = None
+
+def get_mongo_conn_from_request(request: Request) -> MongoConn:
+    mongo = getattr(request.app.state, "mongo", None)
+    if mongo is None:
+        raise RuntimeError("Mongo is not initialized in app.state.mongo")
+    return mongo
+
+
+def get_mongo_db(request: Request):
+    mongo = get_mongo_conn_from_request(request)
+    if mongo.db is None:
+        raise RuntimeError("Mongo database is not initialized")
+    return mongo.db

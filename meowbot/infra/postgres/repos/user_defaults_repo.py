@@ -135,3 +135,49 @@ class UserDefaultsRepo:
                 user_id,
             )
         return dict(row) if row else None
+
+    async def set_trader_enabled(self, user_id, enabled: bool) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                update trader_settings
+                set
+                    enabled = $2,
+                    updated_at = now()
+                where user_id = $1
+                """,
+                user_id,
+                enabled,
+            )
+
+    async def toggle_trader_enabled(self, user_id) -> dict | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                update trader_settings
+                set
+                    enabled = not enabled,
+                    updated_at = now()
+                where user_id = $1
+                returning
+                    user_id,
+                    enabled,
+                    mode,
+                    entry_mode,
+                    entry_value,
+                    risk_profile,
+                    allow_long,
+                    allow_short,
+                    night_mode,
+                    quiet_hours_from,
+                    quiet_hours_to,
+                    max_open_trades,
+                    max_daily_loss,
+                    max_trades_per_day,
+                    current_exchange_account_id,
+                    created_at,
+                    updated_at
+                """,
+                user_id,
+            )
+        return dict(row) if row else None

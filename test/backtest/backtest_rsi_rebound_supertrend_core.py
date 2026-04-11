@@ -473,3 +473,17 @@ def run_backtest_for_tf(symbol: str, tf: str, data_dir: Path, results_dir: Path)
     print("Total time:   ", now_str(time.time() - started), flush=True)
     print("\nTop 20:", flush=True)
     print(summary_df.head(20).to_string(index=False), flush=True)
+
+if __name__ == "__main__":
+    symbol = "BTCUSDT"
+    tf = "1h"
+
+    data_dir = Path("test/data/BTCUSDT")
+    results_dir = Path("test/results/backtest")
+
+    run_backtest_for_tf(
+        symbol=symbol,
+        tf=tf,
+        data_dir=data_dir,
+        results_dir=results_dir,
+    )
