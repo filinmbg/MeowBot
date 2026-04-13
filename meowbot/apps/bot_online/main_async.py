@@ -9,6 +9,7 @@ from meowbot.apps.bot_online.async_runtime import (
     AsyncBotOnlineRuntime,
     MarketEntryProcessResult,
 )
+from meowbot.core.services.risk.per_user_live_risk_service import PerUserLiveRiskService
 from meowbot.core.services.runtime.symbol_rollout_manager import SymbolRolloutManager
 from meowbot.core.services.scheduling.bar_close_scheduler import (
     BarCloseScheduler,
@@ -17,7 +18,13 @@ from meowbot.core.services.scheduling.bar_close_scheduler import (
 from meowbot.core.usecases.async_ensure_market_data import AsyncEnsureMarketDataUseCase
 from meowbot.core.usecases.async_online_entry_cycle import AsyncOnlineEntryCycleUseCase
 from meowbot.core.usecases.async_reconcile_open_trades import AsyncReconcileOpenTradesUseCase
+from meowbot.core.usecases.startup_reconcile_missed_exits import (
+    StartupReconcileMissedExitsUseCase,
+)
 from meowbot.infra.broker.paper import PaperBroker
+from meowbot.infra.exchange.binance_futures_account_async import (
+    BinanceFuturesAccountAsyncConfig,
+)
 from meowbot.infra.exchange.binance_futures_usdtm_async import (
     BinanceFuturesAsyncConfig,
     BinanceFuturesMarketDataAsync,
@@ -27,13 +34,17 @@ from meowbot.infra.mongo.async_client import AsyncMongoConfig, AsyncMongoConn
 from meowbot.infra.mongo.migrations import apply_migrations
 from meowbot.infra.mongo.repos_async.bars_repo_async import BarsRepositoryMongoAsync
 from meowbot.infra.mongo.repos_async.bot_state_repo_async import BotStateRepositoryMongoAsync
-from meowbot.infra.mongo.repos_async.trade_events_repo_async import TradeEventsRepositoryMongoAsync
+from meowbot.infra.mongo.repos_async.trade_events_repo_async import (
+    TradeEventsRepositoryMongoAsync,
+)
 from meowbot.infra.mongo.repos_async.trades_repo_async import TradesRepositoryMongoAsync
 from meowbot.infra.postgres.client import get_pg_pool
 from meowbot.infra.postgres.repos.subscription_runtime_repo import SubscriptionRuntimeRepo
 from meowbot.infra.postgres.repos.trade_entry_cooldowns_repo import (
     TradeEntryCooldownsRepo,
 )
+from meowbot.infra.postgres.repos.user_api_keys_repo import UserApiKeysRepo
+from meowbot.core.services.security.fernet_crypto_service import FernetCryptoService
 
 
 logging.basicConfig(
@@ -139,12 +150,31 @@ async def main() -> None:
     trades_repo = TradesRepositoryMongoAsync(mongo.db)
     bot_state_repo = BotStateRepositoryMongoAsync(mongo.db)
     trade_events_repo = TradeEventsRepositoryMongoAsync(mongo.db)
+    await trade_events_repo.ensure_indexes()
 
     runtime_repo = SubscriptionRuntimeRepo(pg_pool)
     cooldowns_repo = TradeEntryCooldownsRepo(pg_pool)
+    user_api_keys_repo = UserApiKeysRepo(pg_pool)
+    crypto_service = FernetCryptoService.from_env("MEOWBOT_SECRETS_FERNET_KEY")
 
     exchange = BinanceFuturesMarketDataAsync(BinanceFuturesAsyncConfig())
     await wait_for_binance_ready(exchange)
+
+    per_user_live_risk_service = PerUserLiveRiskService(
+        user_api_keys_repo=user_api_keys_repo,
+        crypto_service=crypto_service,
+        account_config=BinanceFuturesAccountAsyncConfig(
+            futures_base_url=os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com"),
+            wallet_base_url=os.getenv("BINANCE_WALLET_BASE_URL", "https://api.binance.com"),
+            timeout_seconds=float(os.getenv("BINANCE_HTTP_TIMEOUT_SECONDS", "15")),
+            max_weight_per_minute=int(os.getenv("BINANCE_MAX_WEIGHT_PER_MINUTE", "600")),
+            max_concurrent_requests=int(os.getenv("BINANCE_MAX_CONCURRENT_REQUESTS", "2")),
+            retry_attempts=int(os.getenv("BINANCE_HTTP_RETRY_ATTEMPTS", "5")),
+            retry_base_delay_seconds=float(os.getenv("BINANCE_HTTP_RETRY_BASE_DELAY_SECONDS", "1.0")),
+            retry_max_delay_seconds=float(os.getenv("BINANCE_HTTP_RETRY_MAX_DELAY_SECONDS", "15.0")),
+            recv_window_ms=int(os.getenv("BINANCE_RECV_WINDOW_MS", "5000")),
+        ),
+    )
 
     broker = PaperBroker()
 
@@ -194,6 +224,7 @@ async def main() -> None:
         max_entry_price_deviation_pct=0.5,
         sandbox_start_balance_usd=float(os.getenv("SANDBOX_START_BALANCE_USD", "1000")),
         cooldowns_repo=cooldowns_repo,
+        per_user_live_risk_service=per_user_live_risk_service,
     )
 
     exit_uc = AsyncReconcileOpenTradesUseCase(
@@ -204,6 +235,14 @@ async def main() -> None:
         max_concurrency=20,
         cooldowns_repo=cooldowns_repo,
         telegram_users_repo=runtime_repo,
+    )
+
+    startup_reconcile_uc = StartupReconcileMissedExitsUseCase(
+        trades_repo=trades_repo,
+        exit_usecase=exit_uc,
+        exchange=exchange,
+        max_bars_per_request=1000,
+        reconcile_tf="1m",
     )
 
     async def bootstrap_warmup() -> None:
@@ -302,6 +341,10 @@ async def main() -> None:
     try:
         await ws_prices.start()
         await bootstrap_warmup()
+
+        startup_reconcile_summary = await startup_reconcile_uc.run()
+        log.info("[main-async] startup reconcile summary=%s", startup_reconcile_summary)
+
         await asyncio.gather(
             runtime.run(),
             rollout_loop(),

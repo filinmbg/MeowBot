@@ -20,6 +20,22 @@ class SubscriptionRuntimeRepo:
 
     async def list_enabled_trading_users(self) -> list[dict[str, Any]]:
         query = """
+        with symbol_cfg as (
+            select
+                tss.user_id,
+                array_agg(tss.symbol order by tss.symbol) as enabled_symbols
+            from trader_symbol_settings tss
+            where tss.enabled = true
+            group by tss.user_id
+        ),
+        timeframe_cfg as (
+            select
+                tfs.user_id,
+                array_agg(tfs.timeframe order by tfs.timeframe) as enabled_timeframes
+            from trader_timeframe_settings tfs
+            where tfs.enabled = true
+            group by tfs.user_id
+        )
         select
             ('tg:' || tp.telegram_id::text) as trading_user_id,
             u.id as user_uuid,
@@ -65,7 +81,11 @@ class SubscriptionRuntimeRepo:
             aus.plan_id,
             aus.plan_code,
             aus.plan_name,
-            aus.features_json
+            aus.features_json,
+
+            coalesce(sc.enabled_symbols, array[]::text[]) as enabled_symbols,
+            coalesce(tc.enabled_timeframes, array[]::text[]) as enabled_timeframes
+
         from users u
         join telegram_profiles tp
             on tp.user_id = u.id
@@ -75,6 +95,10 @@ class SubscriptionRuntimeRepo:
             on np.user_id = u.id
         join v_active_user_subscriptions aus
             on aus.user_id = u.id
+        left join symbol_cfg sc
+            on sc.user_id = u.id
+        left join timeframe_cfg tc
+            on tc.user_id = u.id
         where
             u.status = 'active'
             and tp.is_onboarded = true
@@ -90,7 +114,7 @@ class SubscriptionRuntimeRepo:
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(query)
-        return [dict(row) for row in rows]
+        return [self._normalize_row(dict(row)) for row in rows]
 
     async def get_by_trading_user_id(self, trading_user_id: str) -> dict[str, Any] | None:
         if not trading_user_id.startswith("tg:"):
@@ -103,6 +127,22 @@ class SubscriptionRuntimeRepo:
         telegram_id = int(telegram_id_raw)
 
         query = """
+        with symbol_cfg as (
+            select
+                tss.user_id,
+                array_agg(tss.symbol order by tss.symbol) as enabled_symbols
+            from trader_symbol_settings tss
+            where tss.enabled = true
+            group by tss.user_id
+        ),
+        timeframe_cfg as (
+            select
+                tfs.user_id,
+                array_agg(tfs.timeframe order by tfs.timeframe) as enabled_timeframes
+            from trader_timeframe_settings tfs
+            where tfs.enabled = true
+            group by tfs.user_id
+        )
         select
             ('tg:' || tp.telegram_id::text) as trading_user_id,
             u.id as user_uuid,
@@ -143,7 +183,11 @@ class SubscriptionRuntimeRepo:
             np.notify_stop_loss,
             np.notify_system,
             np.quiet_hours_from,
-            np.quiet_hours_to
+            np.quiet_hours_to,
+
+            coalesce(sc.enabled_symbols, array[]::text[]) as enabled_symbols,
+            coalesce(tc.enabled_timeframes, array[]::text[]) as enabled_timeframes
+
         from users u
         join telegram_profiles tp
             on tp.user_id = u.id
@@ -151,12 +195,17 @@ class SubscriptionRuntimeRepo:
             on ts.user_id = u.id
         left join notification_preferences np
             on np.user_id = u.id
+        left join symbol_cfg sc
+            on sc.user_id = u.id
+        left join timeframe_cfg tc
+            on tc.user_id = u.id
         where tp.telegram_id = $1
         limit 1
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(query, telegram_id)
-        return dict(row) if row else None
+
+        return self._normalize_row(dict(row)) if row else None
 
     async def resolve_notification_target_by_user_id(self, user_id: str) -> dict[str, Any] | None:
         row = await self.get_by_trading_user_id(user_id)
@@ -171,3 +220,8 @@ class SubscriptionRuntimeRepo:
             "username": row.get("username"),
             "first_name": row.get("first_name"),
         }
+
+    def _normalize_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        row["enabled_symbols"] = [str(x).upper() for x in (row.get("enabled_symbols") or [])]
+        row["enabled_timeframes"] = [str(x) for x in (row.get("enabled_timeframes") or [])]
+        return row

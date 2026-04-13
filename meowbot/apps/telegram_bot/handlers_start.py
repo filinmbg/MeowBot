@@ -14,7 +14,7 @@ router = Router()
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, telegram_users_repo, i18n_service) -> None:
+async def cmd_start(message: Message, register_user_usecase, users_repo, i18n_service) -> None:
     user = message.from_user
     chat = message.chat
 
@@ -25,14 +25,13 @@ async def cmd_start(message: Message, telegram_users_repo, i18n_service) -> None
     telegram_lang = getattr(user, "language_code", None)
     normalized_lang = i18n_service.normalize_language(telegram_lang)
 
-    row = await telegram_users_repo.upsert_user(
+    row = await register_user_usecase.execute(
         telegram_id=user.id,
         username=user.username,
         first_name=user.first_name,
         last_name=user.last_name,
         chat_id=chat.id,
-        telegram_language_code=telegram_lang,
-        preferred_language=normalized_lang,
+        language=normalized_lang,
     )
 
     lang = i18n_service.resolve_language(
@@ -59,13 +58,13 @@ async def cmd_start(message: Message, telegram_users_repo, i18n_service) -> None
 
 
 @router.message(lambda m: (m.text or "").strip() in {"🚀 Почати", "🚀 Начать", "🚀 Start"})
-async def onboarding_start(message: Message, telegram_users_repo, i18n_service) -> None:
+async def onboarding_start(message: Message, users_repo, telegram_profiles_repo, i18n_service) -> None:
     user = message.from_user
     if user is None:
         await message.answer("User is undefined.")
         return
 
-    row = await telegram_users_repo.get_by_telegram_id(user.id)
+    row = await users_repo.get_by_telegram_id(user.id)
     preferred_language = row.get("preferred_language") if row else None
     telegram_language_code = getattr(user, "language_code", None)
 
@@ -75,7 +74,7 @@ async def onboarding_start(message: Message, telegram_users_repo, i18n_service) 
     )
     t = lambda key, **kwargs: i18n_service.t(lang, key, **kwargs)
 
-    await telegram_users_repo.mark_onboarded(user.id)
+    await telegram_profiles_repo.mark_onboarded(user.id)
 
     await message.answer(
         t("tutorial_text"),
@@ -91,13 +90,13 @@ async def onboarding_start(message: Message, telegram_users_repo, i18n_service) 
 
 
 @router.message(lambda m: (m.text or "").strip() in {"🏠 Меню", "🏠 Menu"})
-async def show_main_menu(message: Message, telegram_users_repo, i18n_service) -> None:
+async def show_main_menu(message: Message, users_repo, i18n_service) -> None:
     user = message.from_user
     if user is None:
         await message.answer("User is undefined.")
         return
 
-    row = await telegram_users_repo.get_by_telegram_id(user.id)
+    row = await users_repo.get_by_telegram_id(user.id)
     lang = i18n_service.resolve_language(
         preferred_language=row.get("preferred_language") if row else None,
         telegram_language_code=getattr(user, "language_code", None),

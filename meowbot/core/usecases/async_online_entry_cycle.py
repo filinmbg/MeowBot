@@ -30,6 +30,7 @@ class AsyncOnlineEntryCycleUseCase:
         max_entry_price_deviation_pct: float = 0.5,
         sandbox_start_balance_usd: float = 1000.0,
         cooldowns_repo=None,
+        per_user_live_risk_service=None,
     ) -> None:
         self.bars_repo = bars_repo
         self.trades_repo = trades_repo
@@ -42,6 +43,7 @@ class AsyncOnlineEntryCycleUseCase:
         self.max_entry_price_deviation_pct = max_entry_price_deviation_pct
         self.sandbox_start_balance_usd = sandbox_start_balance_usd
         self.cooldowns_repo = cooldowns_repo
+        self.per_user_live_risk_service = per_user_live_risk_service
 
         self.detector = RsiReboundSupertrendDetector(
             RsiReboundSupertrendConfig()
@@ -164,20 +166,25 @@ class AsyncOnlineEntryCycleUseCase:
                 )
                 continue
 
-            deviation_pct = abs((live_entry_price - signal_entry_price) / signal_entry_price) * 100.0
+            price_check = self._check_long_entry_price(
+                signal_entry_price=signal_entry_price,
+                live_entry_price=live_entry_price,
+            )
 
             log.info(
-                "[entry-check] %s %s: bar_close=%s signal_price=%.4f live_price=%.4f deviation=%.3f%% max_allowed=%.3f%%",
+                "[entry-check] %s %s: bar_close=%s signal_price=%.4f live_price=%.4f upward_pct=%.3f downward_pct=%.3f allowed=%s reason=%s",
                 symbol,
                 tf,
                 bar.close_time,
                 signal_entry_price,
                 live_entry_price,
-                deviation_pct,
-                self.max_entry_price_deviation_pct,
+                price_check["upward_pct"],
+                price_check["downward_pct"],
+                price_check["allowed"],
+                price_check["reason"],
             )
 
-            if deviation_pct > self.max_entry_price_deviation_pct:
+            if not price_check["allowed"]:
                 await self.trade_events_repo.add_event(
                     trade_id=f"debug:global:{symbol}:{tf}:{bar.close_time}:{result.rule_id}",
                     event_type="ENTRY_PRICE_MISMATCH",
@@ -190,8 +197,11 @@ class AsyncOnlineEntryCycleUseCase:
                         "tf_entry": tf,
                         "signal_entry_price": signal_entry_price,
                         "live_entry_price": live_entry_price,
-                        "deviation_pct": deviation_pct,
-                        "max_allowed_deviation_pct": self.max_entry_price_deviation_pct,
+                        "reason": price_check["reason"],
+                        "upward_pct": price_check["upward_pct"],
+                        "downward_pct": price_check["downward_pct"],
+                        "max_upward_deviation_pct": price_check["max_upward_deviation_pct"],
+                        "max_downward_deviation_pct": price_check["max_downward_deviation_pct"],
                         "entry_bar_close_time": bar.close_time,
                         "features_ver": self.features_ver,
                     },
@@ -199,13 +209,14 @@ class AsyncOnlineEntryCycleUseCase:
                 await self.bot_state_repo.set_int(cursor_key, bar.close_time)
                 last_processed_close = bar.close_time
                 log.warning(
-                    "[entry-skip] %s %s: price mismatch signal=%.4f live=%.4f deviation=%.3f%% > %.3f%%",
+                    "[entry-skip] %s %s: price mismatch signal=%.4f live=%.4f reason=%s up=%.3f%% down=%.3f%%",
                     symbol,
                     tf,
                     signal_entry_price,
                     live_entry_price,
-                    deviation_pct,
-                    self.max_entry_price_deviation_pct,
+                    price_check["reason"],
+                    price_check["upward_pct"],
+                    price_check["downward_pct"],
                 )
                 continue
 
@@ -219,7 +230,7 @@ class AsyncOnlineEntryCycleUseCase:
                     rule_id=result.rule_id,
                     signal_entry_price=signal_entry_price,
                     live_entry_price=live_entry_price,
-                    deviation_pct=deviation_pct,
+                    deviation_pct=float(price_check["effective_deviation_pct"]),
                     open_trades_by_user=open_trades_by_user,
                 )
 
@@ -248,6 +259,38 @@ class AsyncOnlineEntryCycleUseCase:
         user_id = str(tg_user.get("trading_user_id") or f"tg:{tg_user.get('telegram_id')}")
         trading_mode = str(tg_user.get("trading_mode", "sandbox"))
         user_open_trades = open_trades_by_user.get(user_id, [])
+
+        enforce = self._enforce_subscription_limits(
+            tg_user=tg_user,
+            symbol=symbol,
+            tf=tf,
+            user_open_trades=user_open_trades,
+        )
+        if not enforce["allowed"]:
+            await self.trade_events_repo.add_event(
+                trade_id=f"debug:global:{symbol}:{tf}:{bar.close_time}:{rule_id}:{user_id}",
+                event_type="ENTRY_BLOCKED_SUBSCRIPTION",
+                ts=now_ms,
+                symbol=symbol,
+                user_id=user_id,
+                mode=trading_mode,
+                payload={
+                    "reason": enforce["reason"],
+                    "plan_code": tg_user.get("plan_code"),
+                    "tf_entry": tf,
+                    "rule_id": rule_id,
+                    "features_ver": self.features_ver,
+                },
+            )
+            log.info(
+                "[entry-async] %s %s user=%s: blocked by subscription reason=%s plan=%s",
+                symbol,
+                tf,
+                user_id,
+                enforce["reason"],
+                tg_user.get("plan_code"),
+            )
+            return None
 
         if self.cooldowns_repo is not None:
             cooldown = await self.cooldowns_repo.get_active_cooldown(
@@ -303,17 +346,103 @@ class AsyncOnlineEntryCycleUseCase:
             )
             return None
 
-        history = await self.trades_repo.get_trades(
-            user_id=user_id,
-            mode=trading_mode,
-            limit=5000,
-        )
+        risk_snapshot: dict[str, float | int | str | None] = {}
 
-        sizing = self._build_user_sizing(
-            tg_user=tg_user,
-            entry_price=live_entry_price,
-            history=history,
-        )
+        if trading_mode == "live":
+            if self.per_user_live_risk_service is None:
+                await self.trade_events_repo.add_event(
+                    trade_id=f"debug:global:{symbol}:{tf}:{bar.close_time}:{rule_id}:{user_id}",
+                    event_type="ENTRY_BLOCKED_LIVE_RISK_SERVICE",
+                    ts=now_ms,
+                    symbol=symbol,
+                    user_id=user_id,
+                    mode=trading_mode,
+                    payload={
+                        "reason": "per_user_live_risk_service_unavailable",
+                        "tf_entry": tf,
+                        "rule_id": rule_id,
+                    },
+                )
+                return None
+
+            risk_result = await self.per_user_live_risk_service.check_new_entry(
+                runtime_user_id=user_id,
+                symbol=symbol,
+                entry_price=live_entry_price,
+                default_stake_mode=str(tg_user.get("default_stake_mode", "percent")),
+                default_stake_value=float(tg_user.get("default_stake_value", 1.0) or 1.0),
+                default_leverage=int(tg_user.get("default_leverage", 5) or 5),
+                max_margin_per_trade_mode=str(tg_user.get("max_margin_per_trade_mode", "percent")),
+                max_margin_per_trade_value=float(tg_user.get("max_margin_per_trade_value", 5.0) or 5.0),
+                margin_ratio_warn_pct=float(tg_user.get("margin_ratio_warn_pct", 6.0) or 6.0),
+                margin_ratio_block_pct=float(tg_user.get("margin_ratio_block_pct", 10.0) or 10.0),
+            )
+
+            if not risk_result.allowed:
+                await self.trade_events_repo.add_event(
+                    trade_id=f"debug:global:{symbol}:{tf}:{bar.close_time}:{rule_id}:{user_id}",
+                    event_type="ENTRY_BLOCKED_RISK",
+                    ts=now_ms,
+                    symbol=symbol,
+                    user_id=user_id,
+                    mode=trading_mode,
+                    payload={
+                        "reason": risk_result.reason,
+                        "available_balance_usdt": risk_result.available_balance_usdt,
+                        "current_margin_ratio_pct": risk_result.current_margin_ratio_pct,
+                        "symbol_max_leverage": risk_result.symbol_max_leverage,
+                        "tf_entry": tf,
+                        "rule_id": rule_id,
+                    },
+                )
+                log.info(
+                    "[entry-async] %s %s user=%s: blocked by risk reason=%s",
+                    symbol,
+                    tf,
+                    user_id,
+                    risk_result.reason,
+                )
+                return None
+
+            if risk_result.warn_user:
+                await self.trade_events_repo.add_event(
+                    trade_id=f"debug:global:{symbol}:{tf}:{bar.close_time}:{rule_id}:{user_id}",
+                    event_type="ENTRY_WARNING_RISK",
+                    ts=now_ms,
+                    symbol=symbol,
+                    user_id=user_id,
+                    mode=trading_mode,
+                    payload={
+                        "warning_code": risk_result.warning_code,
+                        "available_balance_usdt": risk_result.available_balance_usdt,
+                        "current_margin_ratio_pct": risk_result.current_margin_ratio_pct,
+                        "tf_entry": tf,
+                        "rule_id": rule_id,
+                    },
+                )
+
+            sizing = {
+                "stake_usd": float(risk_result.stake_margin_usdt),
+                "leverage": float(risk_result.leverage),
+                "qty": float(risk_result.qty),
+            }
+            risk_snapshot = {
+                "available_balance_usdt": risk_result.available_balance_usdt,
+                "current_margin_ratio_pct": risk_result.current_margin_ratio_pct,
+                "symbol_max_leverage": risk_result.symbol_max_leverage,
+            }
+
+        else:
+            history = await self.trades_repo.get_trades(
+                user_id=user_id,
+                mode=trading_mode,
+                limit=5000,
+            )
+            sizing = self._build_user_sizing_sandbox(
+                tg_user=tg_user,
+                entry_price=live_entry_price,
+                history=history,
+            )
 
         entry_price = live_entry_price
         sl_price = entry_price * 0.98
@@ -369,6 +498,7 @@ class AsyncOnlineEntryCycleUseCase:
                 "supertrend_bullish_10_3_0": (bar.features or {}).get("supertrend_bullish_10_3_0"),
                 "default_leverage": tg_user.get("default_leverage", 5),
                 "plan_code": tg_user.get("plan_code"),
+                **risk_snapshot,
             },
         )
 
@@ -389,7 +519,108 @@ class AsyncOnlineEntryCycleUseCase:
 
         return trade
 
-    def _build_user_sizing(
+    def _check_long_entry_price(
+        self,
+        *,
+        signal_entry_price: float,
+        live_entry_price: float,
+    ) -> dict[str, float | str | bool]:
+        """
+        LONG asymmetric rule:
+        - if live > signal by more than 0.5% -> block
+        - if live < signal by up to 1.0% -> allow
+        - if live < signal by more than 1.0% -> block
+        """
+        max_upward_deviation_pct = 0.5
+        max_downward_deviation_pct = 1.0
+
+        upward_pct = 0.0
+        downward_pct = 0.0
+
+        if live_entry_price > signal_entry_price:
+            upward_pct = ((live_entry_price - signal_entry_price) / signal_entry_price) * 100.0
+            if upward_pct > max_upward_deviation_pct:
+                return {
+                    "allowed": False,
+                    "reason": "live_price_too_high_for_long",
+                    "upward_pct": upward_pct,
+                    "downward_pct": 0.0,
+                    "max_upward_deviation_pct": max_upward_deviation_pct,
+                    "max_downward_deviation_pct": max_downward_deviation_pct,
+                    "effective_deviation_pct": upward_pct,
+                }
+
+        elif live_entry_price < signal_entry_price:
+            downward_pct = ((signal_entry_price - live_entry_price) / signal_entry_price) * 100.0
+            if downward_pct > max_downward_deviation_pct:
+                return {
+                    "allowed": False,
+                    "reason": "live_price_too_low_for_long",
+                    "upward_pct": 0.0,
+                    "downward_pct": downward_pct,
+                    "max_upward_deviation_pct": max_upward_deviation_pct,
+                    "max_downward_deviation_pct": max_downward_deviation_pct,
+                    "effective_deviation_pct": downward_pct,
+                }
+
+        return {
+            "allowed": True,
+            "reason": "ok",
+            "upward_pct": upward_pct,
+            "downward_pct": downward_pct,
+            "max_upward_deviation_pct": max_upward_deviation_pct,
+            "max_downward_deviation_pct": max_downward_deviation_pct,
+            "effective_deviation_pct": max(upward_pct, downward_pct),
+        }
+
+    def _enforce_subscription_limits(
+        self,
+        *,
+        tg_user: dict,
+        symbol: str,
+        tf: str,
+        user_open_trades: list,
+    ) -> dict[str, str | bool]:
+        enabled_symbols = {str(x).upper() for x in (tg_user.get("enabled_symbols") or [])}
+        enabled_timeframes = {str(x) for x in (tg_user.get("enabled_timeframes") or [])}
+
+        if enabled_symbols and symbol.upper() not in enabled_symbols:
+            return {"allowed": False, "reason": "symbol_not_allowed"}
+
+        if enabled_timeframes and tf not in enabled_timeframes:
+            return {"allowed": False, "reason": "timeframe_not_allowed"}
+
+        allow_long = bool(tg_user.get("allow_long", True))
+        if not allow_long:
+            return {"allowed": False, "reason": "long_disabled"}
+
+        max_open_trades_total = tg_user.get("max_open_trades_total")
+        if max_open_trades_total is not None:
+            try:
+                total_limit = int(max_open_trades_total)
+                if total_limit >= 0 and len(user_open_trades) >= total_limit:
+                    return {"allowed": False, "reason": "max_open_trades_total_exceeded"}
+            except (TypeError, ValueError):
+                pass
+
+        max_open_trades_per_symbol = tg_user.get("max_open_trades_per_symbol")
+        if max_open_trades_per_symbol is not None:
+            try:
+                per_symbol_limit = int(max_open_trades_per_symbol)
+                open_same_symbol = 0
+                for trade in user_open_trades:
+                    trade_symbol = str(getattr(trade, "symbol", "")).upper()
+                    if trade_symbol == symbol.upper():
+                        open_same_symbol += 1
+
+                if per_symbol_limit >= 0 and open_same_symbol >= per_symbol_limit:
+                    return {"allowed": False, "reason": "max_open_trades_per_symbol_exceeded"}
+            except (TypeError, ValueError):
+                pass
+
+        return {"allowed": True, "reason": "ok"}
+
+    def _build_user_sizing_sandbox(
         self,
         *,
         tg_user: dict,
