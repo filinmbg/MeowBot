@@ -198,3 +198,65 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# =========================
+# MeowBot generated/heavy files
+# =========================
+
+# Historical market data
+test/data/
+data/
+
+# Backtest / analysis outputs
+test/results/
+results/
+reports/
+
+# Trained models / ML artifacts
+models/
+Models/
+checkpoints/
+runs/
+
+# Logs / runtime output
+logs/
+*.log
+
+# Python environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ML / data artifacts
+*.csv.gz
+*.parquet
+*.feather
+*.h5
+*.pt
+*.pth
+*.onnx
+*.pkl
+*.joblib
+*.npz
+*.npy
+*.zip
+
+# Node / frontend if exists
+node_modules/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
