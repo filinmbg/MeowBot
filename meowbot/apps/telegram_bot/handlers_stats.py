@@ -4,15 +4,10 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from meowbot.core.services.notifications.telegram_notify_service import (
-    TelegramNotifyService,
-)
-from meowbot.core.services.notifications.telegram_trade_message_formatter import (
-    TelegramTradeMessageFormatter,
-)
-from meowbot.core.usecases.get_paper_trade_stats import GetPaperTradeStatsUseCase
-from meowbot.infra.mongo.client import MongoConn, MongoConfig
-from meowbot.infra.mongo.repos.trades_repo import TradesRepositoryMongo
+from meowbot.core.services.notifications.stats_message_builder import StatsMessageBuilder
+from meowbot.core.usecases.get_stats_usecase import GetStatsUseCase
+from meowbot.infra.mongo.client_async import get_async_mongo_db
+from meowbot.infra.mongo.repos_async.trades_repo_async import TradesRepositoryMongoAsync
 
 
 router = Router()
@@ -20,17 +15,16 @@ router = Router()
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message) -> None:
-    mongo = MongoConn(MongoConfig())
-    mongo.connect()
-    try:
-        repo = TradesRepositoryMongo(mongo.db)
-        stats_uc = GetPaperTradeStatsUseCase(repo, test_user_ids={"demo_user"})
-        formatter = TelegramTradeMessageFormatter()
-        notifier = TelegramNotifyService()
+    user = message.from_user
+    if user is None:
+        await message.answer("User is unavailable.")
+        return
 
-        stats = stats_uc.get_test_user_stats()
-        text = formatter.format_stats_summary(stats, "Статистика sandbox")
+    db = await get_async_mongo_db()
+    repo = TradesRepositoryMongoAsync(db)
+    stats_uc = GetStatsUseCase(repo)
+    builder = StatsMessageBuilder()
 
-        await message.answer(text, parse_mode="HTML")
-    finally:
-        mongo.close()
+    stats = await stats_uc.get_user_stats(f"tg:{user.id}", mode="sandbox")
+    text = builder.build(stats, "Sandbox stats", "No trades yet.")
+    await message.answer(text, parse_mode="HTML")

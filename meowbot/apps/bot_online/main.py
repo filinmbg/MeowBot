@@ -6,9 +6,7 @@ import time
 
 from meowbot.infra.mongo.client import MongoConn, MongoConfig
 from meowbot.infra.mongo.migrations import apply_migrations
-from meowbot.infra.mongo.repos.bars_repo import BarsRepositoryMongo
 from meowbot.infra.mongo.repos.trades_repo import TradesRepositoryMongo
-from meowbot.infra.mongo.repos.bot_state_repo import BotStateRepositoryMongo
 from meowbot.infra.mongo.repos.trade_events_repo import TradeEventsRepositoryMongo
 
 from meowbot.infra.exchange.binance_futures_usdtm import (
@@ -16,6 +14,8 @@ from meowbot.infra.exchange.binance_futures_usdtm import (
     BinanceFuturesMarketData,
 )
 from meowbot.infra.broker.paper import PaperBroker
+from meowbot.infra.memory.bars_repo import InMemoryBarsRepo
+from meowbot.core.services.runtime.bot_state_cache import InMemoryBotStateRepository
 
 from meowbot.core.services.execution.entry.portfolio_gate import PortfolioGate
 from meowbot.core.usecases.ensure_market_data import EnsureMarketDataUseCase
@@ -76,9 +76,9 @@ async def main() -> None:
         timeframes=("1m", "15m", "30m", "1h", "2h", "4h", "1d"),
     )
 
-    bars_repo = BarsRepositoryMongo(conn.db)
+    bars_repo = InMemoryBarsRepo()
     trades_repo = TradesRepositoryMongo(conn.db)
-    bot_state_repo = BotStateRepositoryMongo(conn.db)
+    bot_state_repo = InMemoryBotStateRepository()
     trade_events_repo = TradeEventsRepositoryMongo(conn.db)
 
     exchange = BinanceFuturesMarketData(BinanceFuturesConfig())

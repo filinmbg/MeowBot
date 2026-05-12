@@ -5,6 +5,9 @@ import time
 from dataclasses import replace
 from typing import Any
 
+from meowbot.core.domain.enums import TradeStatus
+from meowbot.core.services.runtime.symbol_validator import validate_binance_usdt_perp_symbol
+
 
 log = logging.getLogger("meowbot")
 
@@ -26,18 +29,25 @@ class StartupReconcileMissedExitsUseCase:
         exchange,
         max_bars_per_request: int = 1000,
         reconcile_tf: str = "1m",
+        live_sync_service=None,
+        active_trades_cache=None,
     ) -> None:
         self.trades_repo = trades_repo
         self.exit_usecase = exit_usecase
         self.exchange = exchange
         self.max_bars_per_request = int(max_bars_per_request)
         self.reconcile_tf = reconcile_tf
+        self.live_sync_service = live_sync_service
+        self.active_trades_cache = active_trades_cache
 
     async def run(self, *, now_ms: int | None = None) -> dict[str, Any]:
         if now_ms is None:
             now_ms = int(time.time() * 1000)
 
-        open_trades = await self.trades_repo.get_open_trades()
+        if self.active_trades_cache is not None:
+            open_trades = self.active_trades_cache.get_all_open_trades()
+        else:
+            open_trades = await self.trades_repo.get_open_trades()
         if not open_trades:
             log.info("[startup-reconcile] no open trades")
             return {
@@ -81,16 +91,41 @@ class StartupReconcileMissedExitsUseCase:
         return summary
 
     async def _reconcile_single_trade(self, *, trade, now_ms: int) -> dict[str, Any]:
-        symbol = str(trade.symbol)
-        from_ts = int(getattr(trade, "exit_last_check_at", 0) or 0)
+        current = trade
+        invalid_trade = await self._quarantine_invalid_symbol_if_needed(current, now_ms)
+        if invalid_trade is not None:
+            self._update_cache(invalid_trade)
+            await self._persist_trade(invalid_trade)
+            return {
+                "bars_processed": 0,
+                "closed": True,
+            }
+
+        if str(getattr(current, "mode", "")) == "live" and self.live_sync_service is not None:
+            current = await self.live_sync_service.sync_trade(
+                current,
+                now_ms=now_ms,
+                reason="startup_reconcile",
+                force=True,
+            )
+            if self._is_closed(current):
+                self._update_cache(current)
+                await self._persist_trade(current)
+                return {
+                    "bars_processed": 0,
+                    "closed": True,
+                }
+
+        symbol = str(current.symbol)
+        from_ts = int(getattr(current, "exit_last_check_at", 0) or 0)
 
         if from_ts <= 0:
             log.warning(
                 "[startup-reconcile] trade_id=%s symbol=%s has empty exit_last_check_at, using opened_at",
-                trade.trade_id,
+                current.trade_id,
                 symbol,
             )
-            from_ts = int(getattr(trade, "opened_at", now_ms) or now_ms)
+            from_ts = int(getattr(current, "opened_at", now_ms) or now_ms)
 
         # Не беремо поточну незакриту 1m свічку, тільки closed candles
         to_ts = self._floor_to_closed_minute(now_ms)
@@ -113,7 +148,6 @@ class StartupReconcileMissedExitsUseCase:
                 "closed": False,
             }
 
-        current = trade
         bars_processed = 0
 
         side = current.side.value if hasattr(current.side, "value") else str(current.side)
@@ -143,7 +177,8 @@ class StartupReconcileMissedExitsUseCase:
 
             bars_processed += 1
 
-        await self.trades_repo.update_trade(current)
+        self._update_cache(current)
+        await self._persist_trade(current)
 
         if self._is_closed(current):
             log.info(
@@ -167,6 +202,48 @@ class StartupReconcileMissedExitsUseCase:
             "bars_processed": bars_processed,
             "closed": self._is_closed(current),
         }
+
+    async def _quarantine_invalid_symbol_if_needed(self, trade, now_ms: int):
+        validation = validate_binance_usdt_perp_symbol(getattr(trade, "symbol", ""))
+        if validation.valid:
+            return None
+
+        current = replace(
+            trade,
+            status=TradeStatus.ERROR_INVALID_SYMBOL,
+            closed_at=now_ms,
+            exit_last_check_at=now_ms,
+            exit_reason="ERROR_INVALID_SYMBOL",
+            exchange_sync_status="invalid_symbol",
+            exchange_sync_error=validation.reason,
+            qty_remaining=0.0,
+            remaining_pct=0.0,
+        )
+        log.warning(
+            "[startup-reconcile] INVALID_SYMBOL_SKIPPED trade_id=%s symbol=%s user=%s reason=%s action=quarantined",
+            getattr(trade, "trade_id", "-"),
+            validation.normalized_symbol or validation.symbol,
+            getattr(trade, "user_id", "-"),
+            validation.reason,
+        )
+
+        trade_events_repo = getattr(self.exit_usecase, "trade_events_repo", None)
+        if trade_events_repo is not None:
+            await trade_events_repo.add_event(
+                trade_id=getattr(trade, "trade_id", f"invalid:{validation.normalized_symbol}"),
+                event_type="INVALID_SYMBOL_SKIPPED",
+                ts=now_ms,
+                symbol=validation.normalized_symbol or validation.symbol,
+                user_id=str(getattr(trade, "user_id", "system") or "system"),
+                mode=str(getattr(trade, "mode", "sandbox") or "sandbox"),
+                payload={
+                    "reason": "invalid_symbol",
+                    "invalid_reason": validation.reason,
+                    "action": "startup_quarantined_without_binance_call",
+                    "status": TradeStatus.ERROR_INVALID_SYMBOL.value,
+                },
+            )
+        return current
 
     async def _fetch_closed_1m_candles(
         self,
@@ -323,3 +400,20 @@ class StartupReconcileMissedExitsUseCase:
     def _is_closed(trade) -> bool:
         status = trade.status.value if hasattr(trade.status, "value") else str(trade.status)
         return status == "CLOSED"
+
+    def _update_cache(self, trade) -> None:
+        if self.active_trades_cache is None:
+            return
+        self.active_trades_cache.update_from_trade(trade)
+
+    async def _persist_trade(self, trade) -> None:
+        try:
+            await self.trades_repo.update_trade(trade)
+        except Exception as exc:
+            log.warning(
+                "[startup-reconcile] trade persistence skipped trade_id=%s symbol=%s error=%s:%s",
+                getattr(trade, "trade_id", "-"),
+                getattr(trade, "symbol", "-"),
+                type(exc).__name__,
+                exc,
+            )

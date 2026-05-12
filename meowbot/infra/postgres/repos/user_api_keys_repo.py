@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import asyncpg
@@ -8,6 +9,13 @@ import asyncpg
 class UserApiKeysRepo:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self.pool = pool
+
+    def _jsonb_payload(self, value: dict[str, Any] | None) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False)
 
     async def get_active_key_by_runtime_user_id(
         self,
@@ -119,6 +127,8 @@ class UserApiKeysRepo:
             created_at,
             updated_at
         """
+        permissions_payload = self._jsonb_payload(permissions_json)
+
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 query,
@@ -130,7 +140,7 @@ class UserApiKeysRepo:
                 encrypted_passphrase,
                 api_key_fingerprint,
                 exchange_account_fingerprint,
-                permissions_json,
+                permissions_payload,
                 validation_status,
                 is_active,
             )
@@ -182,7 +192,7 @@ class UserApiKeysRepo:
                 encrypted_passphrase,
                 api_key_fingerprint,
                 exchange_account_fingerprint,
-                permissions_json,
+                permissions_payload,
                 validation_status,
                 is_active,
             )
@@ -239,7 +249,7 @@ class UserApiKeysRepo:
                 encrypted_passphrase,
                 api_key_fingerprint,
                 exchange_account_fingerprint,
-                permissions_json,
+                permissions_payload,
                 validation_status,
                 is_active,
             )
@@ -263,7 +273,7 @@ class UserApiKeysRepo:
         where id = $1
         """
         async with self.pool.acquire() as conn:
-            await conn.execute(query, key_id, permissions_json)
+            await conn.execute(query, key_id, self._jsonb_payload(permissions_json))
 
     async def deactivate_other_keys_for_user(
         self,
@@ -296,3 +306,288 @@ class UserApiKeysRepo:
 
         async with self.pool.acquire() as conn:
             await conn.execute(query, *args)
+
+    async def get_latest_key_by_runtime_user_id(
+        self,
+        *,
+        runtime_user_id: str,
+        exchange: str = "binance",
+    ) -> dict[str, Any] | None:
+        if not runtime_user_id.startswith("tg:"):
+            return None
+
+        telegram_id_raw = runtime_user_id.removeprefix("tg:")
+        if not telegram_id_raw.isdigit():
+            return None
+
+        telegram_id = int(telegram_id_raw)
+
+        query = """
+        select
+            u.id as user_uuid,
+            u.email,
+            u.display_name,
+            tp.telegram_id,
+            k.id,
+            k.user_id,
+            k.exchange,
+            k.label,
+            k.api_key_fingerprint,
+            k.exchange_account_fingerprint,
+            k.permissions_json,
+            k.permissions_checked_at,
+            k.validation_status,
+            k.is_active,
+            k.last_validated_at,
+            k.created_at,
+            k.updated_at
+        from telegram_profiles tp
+        join users u
+            on u.id = tp.user_id
+        join user_api_keys k
+            on k.user_id = u.id
+        where
+            tp.telegram_id = $1
+            and k.exchange = $2
+        order by
+            k.is_active desc,
+            k.last_validated_at desc nulls last,
+            k.created_at desc
+        limit 1
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, telegram_id, exchange)
+        return dict(row) if row else None
+
+    async def get_latest_key_material_by_runtime_user_id(
+        self,
+        *,
+        runtime_user_id: str,
+        exchange: str = "binance",
+        require_active: bool = False,
+    ) -> dict[str, Any] | None:
+        if not runtime_user_id.startswith("tg:"):
+            return None
+
+        telegram_id_raw = runtime_user_id.removeprefix("tg:")
+        if not telegram_id_raw.isdigit():
+            return None
+
+        telegram_id = int(telegram_id_raw)
+
+        active_filter = "and k.is_active = true" if require_active else ""
+
+        query = f"""
+        select
+            u.id as user_uuid,
+            u.email,
+            u.display_name,
+            tp.telegram_id,
+            tp.chat_id,
+            tp.username,
+            k.id,
+            k.user_id,
+            k.exchange,
+            k.label,
+            k.encrypted_api_key,
+            k.encrypted_api_secret,
+            k.encrypted_passphrase,
+            k.api_key_fingerprint,
+            k.exchange_account_fingerprint,
+            k.permissions_json,
+            k.permissions_checked_at,
+            k.validation_status,
+            k.is_active,
+            k.last_validated_at,
+            k.created_at,
+            k.updated_at
+        from telegram_profiles tp
+        join users u
+            on u.id = tp.user_id
+        join user_api_keys k
+            on k.user_id = u.id
+        where
+            tp.telegram_id = $1
+            and k.exchange = $2
+            {active_filter}
+        order by
+            k.is_active desc,
+            k.last_validated_at desc nulls last,
+            k.created_at desc
+        limit 1
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, telegram_id, exchange)
+        return dict(row) if row else None
+
+    async def get_latest_key_by_user_id(
+        self,
+        *,
+        user_id,
+        exchange: str = "binance",
+    ) -> dict[str, Any] | None:
+        query = """
+        select
+            u.id as user_uuid,
+            u.email,
+            u.display_name,
+            tp.telegram_id,
+            tp.chat_id,
+            tp.username,
+            k.id,
+            k.user_id,
+            k.exchange,
+            k.label,
+            k.api_key_fingerprint,
+            k.exchange_account_fingerprint,
+            k.permissions_json,
+            k.permissions_checked_at,
+            k.validation_status,
+            k.is_active,
+            k.last_validated_at,
+            k.created_at,
+            k.updated_at
+        from users u
+        left join telegram_profiles tp
+            on tp.user_id = u.id
+        join user_api_keys k
+            on k.user_id = u.id
+        where u.id = $1
+          and k.exchange = $2
+        order by
+            k.is_active desc,
+            k.last_validated_at desc nulls last,
+            k.created_at desc
+        limit 1
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, user_id, exchange)
+        return dict(row) if row else None
+
+    async def get_latest_key_material_by_user_id(
+        self,
+        *,
+        user_id,
+        exchange: str = "binance",
+        require_active: bool = False,
+    ) -> dict[str, Any] | None:
+        active_filter = "and k.is_active = true" if require_active else ""
+
+        query = f"""
+        select
+            u.id as user_uuid,
+            u.email,
+            u.display_name,
+            tp.telegram_id,
+            tp.chat_id,
+            tp.username,
+            k.id,
+            k.user_id,
+            k.exchange,
+            k.label,
+            k.encrypted_api_key,
+            k.encrypted_api_secret,
+            k.encrypted_passphrase,
+            k.api_key_fingerprint,
+            k.exchange_account_fingerprint,
+            k.permissions_json,
+            k.permissions_checked_at,
+            k.validation_status,
+            k.is_active,
+            k.last_validated_at,
+            k.created_at,
+            k.updated_at
+        from users u
+        left join telegram_profiles tp
+            on tp.user_id = u.id
+        join user_api_keys k
+            on k.user_id = u.id
+        where u.id = $1
+          and k.exchange = $2
+          {active_filter}
+        order by
+            k.is_active desc,
+            k.last_validated_at desc nulls last,
+            k.created_at desc
+        limit 1
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, user_id, exchange)
+        return dict(row) if row else None
+
+    async def update_validation_result(
+        self,
+        *,
+        key_id,
+        permissions_json: dict[str, Any],
+        validation_status: str,
+        is_active: bool,
+        exchange_account_fingerprint: str | None = None,
+    ) -> dict[str, Any] | None:
+        query = """
+        update user_api_keys
+        set
+            permissions_json = $2::jsonb,
+            permissions_checked_at = now(),
+            validation_status = $3,
+            is_active = $4,
+            exchange_account_fingerprint = coalesce($5, exchange_account_fingerprint),
+            last_validated_at = case when $3 = 'valid' then now() else last_validated_at end,
+            updated_at = now()
+        where id = $1
+        returning
+            id,
+            user_id,
+            exchange,
+            label,
+            api_key_fingerprint,
+            exchange_account_fingerprint,
+            permissions_json,
+            permissions_checked_at,
+            validation_status,
+            is_active,
+            last_validated_at,
+            created_at,
+            updated_at
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                query,
+                key_id,
+                self._jsonb_payload(permissions_json),
+                validation_status,
+                is_active,
+                exchange_account_fingerprint,
+            )
+        return dict(row) if row else None
+
+    async def list_invalid_users(self, *, exchange: str = "binance", limit: int = 50) -> list[dict[str, Any]]:
+        query = """
+        select
+            u.id as user_uuid,
+            u.email,
+            u.display_name,
+            tp.telegram_id,
+            tp.username,
+            k.id as key_id,
+            k.label,
+            k.validation_status,
+            k.is_active,
+            k.permissions_json,
+            k.permissions_checked_at,
+            k.last_validated_at,
+            k.updated_at
+        from user_api_keys k
+        join users u
+            on u.id = k.user_id
+        left join telegram_profiles tp
+            on tp.user_id = u.id
+        where
+            k.exchange = $1
+            and k.validation_status <> 'valid'
+        order by k.updated_at desc
+        limit $2
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, exchange, int(limit))
+        return [dict(row) for row in rows]

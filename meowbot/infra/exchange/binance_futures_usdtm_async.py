@@ -84,6 +84,20 @@ class BinanceFuturesMarketDataAsync:
             log.warning("[binance] get_exchange_info failed: %s: %s", type(exc).__name__, exc)
             return None
 
+    async def get_24hr_tickers(self) -> list[dict] | None:
+        try:
+            payload = await self._request_json(
+                "/fapi/v1/ticker/24hr",
+                params={},
+                weight=40,
+            )
+            if isinstance(payload, list):
+                return payload
+            return None
+        except Exception as exc:
+            log.warning("[binance] get_24hr_tickers failed: %s: %s", type(exc).__name__, exc)
+            return None
+
     async def get_mark_price(self, symbol: str) -> float | None:
         try:
             payload = await self._request_json(

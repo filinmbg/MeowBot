@@ -1,258 +1,232 @@
 from __future__ import annotations
 
 from aiogram import Router
-from aiogram.types import Message
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from meowbot.apps.telegram_bot.keyboards.main_menu import (
-    build_back_menu_keyboard,
-    build_bot_control_keyboard,
+    build_home_keyboard,
     build_main_menu_keyboard,
+    build_onboarding_keyboard,
+)
+from meowbot.apps.telegram_bot.menu_support import (
+    api_status_key,
+    current_trading_mode,
+    fetch_live_account_snapshot,
+    format_money,
+    get_user_trade_rows,
+    html_value,
+    is_admin_user,
+    live_balance_from_snapshot,
+    normalize_mapping,
+    risk_status_key,
+    safe_edit_message,
+    status_value,
+    sum_realized_pnl,
+    user_display_name,
 )
 
 
 router = Router()
 
 
-async def _get_lang_and_t(user, telegram_users_repo, i18n_service):
-    row = await telegram_users_repo.get_by_telegram_id(user.id)
+async def _resolve_menu_state(
+    message: Message,
+    *,
+    i18n_service,
+    users_repo,
+    register_user_usecase=None,
+    telegram_users_repo=None,
+):
+    user = message.from_user
+    chat = message.chat
+    if user is None:
+        return None, "en"
+
+    user_row = await users_repo.get_by_telegram_id(user.id)
+    telegram_lang = getattr(user, "language_code", None)
+
+    if not user_row and register_user_usecase is not None and chat is not None:
+        normalized_lang = i18n_service.normalize_language(telegram_lang)
+        user_row = await register_user_usecase.execute(
+            telegram_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            chat_id=chat.id,
+            language=normalized_lang,
+        )
+        if telegram_users_repo is not None:
+            await telegram_users_repo.upsert_user(
+                telegram_id=int(user.id),
+                username=user.username,
+                first_name=user.first_name,
+                last_name=user.last_name,
+                chat_id=int(chat.id),
+                telegram_language_code=telegram_lang,
+                preferred_language=(user_row or {}).get("preferred_language") or normalized_lang,
+            )
+
     lang = i18n_service.resolve_language(
-        preferred_language=row.get("preferred_language") if row else None,
+        preferred_language=user_row.get("preferred_language") if user_row else None,
+        telegram_language_code=telegram_lang,
+    )
+    return user_row, lang
+
+
+async def render_home_screen(
+    target,
+    *,
+    i18n_service,
+    users_repo,
+    user_subscriptions_repo,
+    runtime_repo,
+    user_api_keys_repo,
+    trades_repo,
+    live_account_provider=None,
+    admin_ids=None,
+    **_,
+) -> None:
+    user = target.from_user
+    if user is None:
+        return
+
+    user_row = await users_repo.get_by_telegram_id(user.id)
+    lang = i18n_service.resolve_language(
+        preferred_language=user_row.get("preferred_language") if user_row else None,
         telegram_language_code=getattr(user, "language_code", None),
     )
     t = lambda key, **kwargs: i18n_service.t(lang, key, **kwargs)
-    return row, lang, t
 
-
-def _mode_label(lang: str, mode: str) -> str:
-    if lang == "ru":
-        return "Sandbox" if mode == "sandbox" else "Live"
-    if lang == "en":
-        return "Sandbox" if mode == "sandbox" else "Live"
-    return "Sandbox" if mode == "sandbox" else "Live"
-
-
-def _yes_no_label(lang: str, value: bool) -> str:
-    if lang == "ru":
-        return "включены" if value else "выключены"
-    if lang == "en":
-        return "enabled" if value else "disabled"
-    return "увімкнені" if value else "вимкнені"
-
-
-def _bot_status_label(lang: str, enabled: bool) -> str:
-    if lang == "ru":
-        return "🟢 Включен" if enabled else "🔴 Выключен"
-    if lang == "en":
-        return "🟢 Enabled" if enabled else "🔴 Disabled"
-    return "🟢 Увімкнений" if enabled else "🔴 Вимкнений"
-
-
-def _build_my_bot_text(lang: str, data: dict) -> str:
-    if lang == "ru":
-        return (
-            "🤖 <b>Мой бот</b>\n\n"
-            f"<b>Статус:</b> {_bot_status_label(lang, bool(data.get('bot_enabled', True)))}\n"
-            f"<b>Режим:</b> {_mode_label(lang, str(data.get('trading_mode', 'sandbox')))}\n"
-            f"<b>Язык:</b> {data.get('preferred_language', 'ru')}\n"
-            f"<b>Sandbox баланс:</b> {float(data.get('sandbox_balance_usd', 0.0)):.2f} USD\n"
-            f"<b>Открытых сделок:</b> {int(data.get('open_trades_count', 0))}\n"
-            f"<b>Закрытых сделок:</b> {int(data.get('closed_trades_count', 0))}\n"
-            f"<b>Размер позиции:</b> {float(data.get('default_stake_value', 1.0)):.2f}%\n"
-            f"<b>Плечо:</b> x{int(data.get('default_leverage', 20))}\n"
-            f"<b>Уведомления:</b> {_yes_no_label(lang, bool(data.get('notifications_enabled', True)))}"
-        )
-
-    if lang == "en":
-        return (
-            "🤖 <b>My Bot</b>\n\n"
-            f"<b>Status:</b> {_bot_status_label(lang, bool(data.get('bot_enabled', True)))}\n"
-            f"<b>Mode:</b> {_mode_label(lang, str(data.get('trading_mode', 'sandbox')))}\n"
-            f"<b>Language:</b> {data.get('preferred_language', 'en')}\n"
-            f"<b>Sandbox balance:</b> {float(data.get('sandbox_balance_usd', 0.0)):.2f} USD\n"
-            f"<b>Open trades:</b> {int(data.get('open_trades_count', 0))}\n"
-            f"<b>Closed trades:</b> {int(data.get('closed_trades_count', 0))}\n"
-            f"<b>Position size:</b> {float(data.get('default_stake_value', 1.0)):.2f}%\n"
-            f"<b>Leverage:</b> x{int(data.get('default_leverage', 20))}\n"
-            f"<b>Notifications:</b> {_yes_no_label(lang, bool(data.get('notifications_enabled', True)))}"
-        )
-
-    return (
-        "🤖 <b>Мій бот</b>\n\n"
-        f"<b>Статус:</b> {_bot_status_label(lang, bool(data.get('bot_enabled', True)))}\n"
-        f"<b>Режим:</b> {_mode_label(lang, str(data.get('trading_mode', 'sandbox')))}\n"
-        f"<b>Мова:</b> {data.get('preferred_language', 'uk')}\n"
-        f"<b>Sandbox баланс:</b> {float(data.get('sandbox_balance_usd', 0.0)):.2f} USD\n"
-        f"<b>Відкритих трейдів:</b> {int(data.get('open_trades_count', 0))}\n"
-        f"<b>Закритих трейдів:</b> {int(data.get('closed_trades_count', 0))}\n"
-        f"<b>Розмір позиції:</b> {float(data.get('default_stake_value', 1.0)):.2f}%\n"
-        f"<b>Плече:</b> x{int(data.get('default_leverage', 20))}\n"
-        f"<b>Нотифікації:</b> {_yes_no_label(lang, bool(data.get('notifications_enabled', True)))}"
+    runtime_row = normalize_mapping(await runtime_repo.get_by_trading_user_id(f"tg:{user.id}"))
+    subscription = normalize_mapping(
+        await user_subscriptions_repo.get_active_detailed_by_user_id(user_row["id"])
+    ) if user_row else {}
+    api_row = normalize_mapping(
+        await user_api_keys_repo.get_latest_key_by_runtime_user_id(runtime_user_id=f"tg:{user.id}")
     )
+    current_mode = current_trading_mode(runtime_row)
+    trade_rows = await get_user_trade_rows(trades_repo, user_id=f"tg:{user.id}", mode=current_mode)
+    open_trades = [row for row in trade_rows if status_value(row) == "OPEN"]
+    realized_pnl = sum_realized_pnl(trade_rows)
+    live_snapshot: dict = {}
+    current_ratio = None
+    if current_mode == "live":
+        live_snapshot, _ = await fetch_live_account_snapshot(
+            live_account_provider,
+            runtime_user_id=f"tg:{user.id}",
+        )
+        balance_value = live_balance_from_snapshot(live_snapshot)
+        balance_text = (
+            format_money(balance_value, "USDT")
+            if balance_value is not None
+            else t("trades.live_balance_unavailable")
+        )
+        current_ratio = live_snapshot.get("marginRatioPct")
+    else:
+        sandbox_start_balance = float(runtime_row.get("sandbox_start_balance_usd") or 1000.0)
+        balance_text = format_money(sandbox_start_balance + realized_pnl)
+    risk_key = risk_status_key(
+        block_threshold=runtime_row.get("margin_ratio_block_pct"),
+        warn_threshold=runtime_row.get("margin_ratio_warn_pct"),
+        current_ratio=current_ratio,
+    )
+    trial_value = t("common.yes") if subscription.get("is_trial") else t("common.no")
+    text = "\n".join(
+        [
+            t("home.title"),
+            "",
+            t("home.greeting", name=html_value(user_display_name(user_row))),
+            f"<b>{t('home.plan')}:</b> {html_value(subscription.get('plan_name', '-'))}",
+            f"<b>{t('home.trial')}:</b> {trial_value}",
+            f"<b>{t('home.mode')}:</b> {t('mode.live') if current_mode == 'live' else t('mode.sandbox')}",
+            f"<b>{t('home.api_status')}:</b> {t(api_status_key(api_row))}",
+            f"<b>{t('home.balance')}:</b> {balance_text}",
+            f"<b>{t('home.active_trades')}:</b> {len(open_trades)}",
+            f"<b>{t('home.risk_status')}:</b> {t(risk_key)}",
+        ]
+    )
+    if not api_row:
+        text += f"\n\n{t('home.no_api_hint')}"
+
+    if isinstance(target, Message):
+        await target.answer(text, parse_mode="HTML", reply_markup=build_home_keyboard(t))
+        return
+
+    await safe_edit_message(target, text=text, reply_markup=build_home_keyboard(t))
 
 
-@router.message(lambda m: (m.text or "").strip() in {"🤖 Мій бот", "🤖 Мой бот", "🤖 My Bot"})
-async def my_bot_handler(
-    message: Message,
-    telegram_users_repo,
-    i18n_service,
-    bot_views_uc,
-) -> None:
+async def render_help_screen(target, *, i18n_service, users_repo, **_) -> None:
+    user = target.from_user
+    if user is None:
+        return
+
+    user_row = await users_repo.get_by_telegram_id(user.id)
+    lang = i18n_service.resolve_language(
+        preferred_language=user_row.get("preferred_language") if user_row else None,
+        telegram_language_code=getattr(user, "language_code", None),
+    )
+    t = lambda key, **kwargs: i18n_service.t(lang, key, **kwargs)
+    text = f"{t('help.title')}\n\n{t('help.text')}"
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"\U0001f511 {t('settings.api')}", callback_data="api:show"),
+                InlineKeyboardButton(text=t("reply.plan"), callback_data="plan:show"),
+            ],
+            [
+                InlineKeyboardButton(text=t("common.back"), callback_data="nav:back:home"),
+            ],
+        ]
+    )
+    await target.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.message(Command("menu"))
+@router.message(lambda m: (m.text or "").strip().lower() in {"menu", "\u043c\u0435\u043d\u044e"})
+async def restore_main_menu_handler(message: Message, **deps) -> None:
     user = message.from_user
     if user is None:
         await message.answer("User is undefined.")
         return
 
-    row, lang, t = await _get_lang_and_t(user, telegram_users_repo, i18n_service)
-    data = await bot_views_uc.get_my_bot_view(user.id)
+    user_row, lang = await _resolve_menu_state(
+        message,
+        i18n_service=deps["i18n_service"],
+        users_repo=deps["users_repo"],
+        register_user_usecase=deps.get("register_user_usecase"),
+        telegram_users_repo=deps.get("telegram_users_repo"),
+    )
+    t = lambda key, **kwargs: deps["i18n_service"].t(lang, key, **kwargs)
 
-    # на всяк випадок синхронізуємо bot_enabled із профілю
-    if row is not None and "bot_enabled" in row:
-        data["bot_enabled"] = bool(row.get("bot_enabled", True))
-
-    text = _build_my_bot_text(lang, data)
+    if not user_row or not bool(user_row.get("is_onboarded")):
+        await message.answer(
+            t("start.welcome_new"),
+            parse_mode="HTML",
+            reply_markup=build_onboarding_keyboard(t),
+        )
+        return
 
     await message.answer(
-        text,
+        t("start.welcome_back"),
         parse_mode="HTML",
-        reply_markup=build_bot_control_keyboard(
+        reply_markup=build_main_menu_keyboard(
             t,
-            enabled=bool(data.get("bot_enabled", True)),
+            is_admin=is_admin_user(user_row, user.id, deps.get("admin_ids") or set()),
         ),
     )
 
 
-@router.message(lambda m: (m.text or "").strip() in {"🟢 Увімкнути бота"})
-async def enable_bot_handler(message: Message, telegram_users_repo, i18n_service, bot_views_uc) -> None:
-    user = message.from_user
-    if user is None:
-        await message.answer("User is undefined.")
-        return
-
-    await telegram_users_repo.set_bot_enabled(user.id, True)
-
-    _, lang, t = await _get_lang_and_t(user, telegram_users_repo, i18n_service)
-    data = await bot_views_uc.get_my_bot_view(user.id)
-    data["bot_enabled"] = True
-
-    text = _build_my_bot_text(lang, data)
-
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=build_bot_control_keyboard(t, enabled=True),
-    )
+@router.message(Command("help"))
+async def help_command_handler(message: Message, **deps) -> None:
+    await render_help_screen(message, **deps)
 
 
-@router.message(lambda m: (m.text or "").strip() in {"🔴 Вимкнути бота"})
-async def disable_bot_handler(message: Message, telegram_users_repo, i18n_service, bot_views_uc) -> None:
-    user = message.from_user
-    if user is None:
-        await message.answer("User is undefined.")
-        return
-
-    await telegram_users_repo.set_bot_enabled(user.id, False)
-
-    _, lang, t = await _get_lang_and_t(user, telegram_users_repo, i18n_service)
-    data = await bot_views_uc.get_my_bot_view(user.id)
-    data["bot_enabled"] = False
-
-    text = _build_my_bot_text(lang, data)
-
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=build_bot_control_keyboard(t, enabled=False),
-    )
+@router.message(lambda m: (m.text or "").strip() in {"\U0001f3e0 \u0413\u043e\u043b\u043e\u0432\u043d\u0430", "\U0001f3e0 Home", "\U0001f3e0 \u0413\u043b\u0430\u0432\u043d\u0430\u044f"})
+async def home_message_handler(message: Message, **deps) -> None:
+    await render_home_screen(message, **deps)
 
 
-@router.message(lambda m: (m.text or "").strip() in {"📈 Трейди", "📈 Сделки", "📈 Trades"})
-async def trades_handler(
-    message: Message,
-    telegram_users_repo,
-    i18n_service,
-    bot_views_uc,
-    bot_views_builder,
-) -> None:
-    user = message.from_user
-    if user is None:
-        await message.answer("User is undefined.")
-        return
-
-    _, lang, t = await _get_lang_and_t(user, telegram_users_repo, i18n_service)
-    data = await bot_views_uc.get_trades_view(user.id)
-    text = bot_views_builder.build_trades(lang, data)
-
-    await message.answer(
-        text,
-        parse_mode="HTML",
-        reply_markup=build_main_menu_keyboard(t),
-    )
-
-
-@router.message(lambda m: (m.text or "").strip() in {"⚙️ Налаштування", "⚙️ Настройки", "⚙️ Settings"})
-async def settings_handler(message: Message, telegram_users_repo, i18n_service) -> None:
-    user = message.from_user
-    if user is None:
-        await message.answer("User is undefined.")
-        return
-
-    _, _, t = await _get_lang_and_t(user, telegram_users_repo, i18n_service)
-
-    await message.answer(
-        t("settings_text"),
-        parse_mode="HTML",
-        reply_markup=build_back_menu_keyboard(t),
-    )
-
-    await message.answer(
-        t("btn_language"),
-        reply_markup=build_back_menu_keyboard(t),
-    )
-
-
-@router.message(lambda m: (m.text or "").strip() in {"👤 Профіль", "👤 Профиль", "👤 Profile"})
-async def profile_handler(message: Message, telegram_users_repo, i18n_service) -> None:
-    user = message.from_user
-    if user is None:
-        await message.answer("User is undefined.")
-        return
-
-    row, _, t = await _get_lang_and_t(user, telegram_users_repo, i18n_service)
-
-    if not row:
-        await message.answer(
-            f"{t('profile_title')}\n\n{t('profile_not_found')}",
-            parse_mode="HTML",
-            reply_markup=build_main_menu_keyboard(t),
-        )
-        return
-
-    username_line = f"<b>{t('profile_username')}:</b> @{row.get('username')}\n" if row.get("username") else ""
-
-    await message.answer(
-        f"{t('profile_title')}\n\n"
-        f"<b>{t('profile_tg_id')}:</b> <code>{row.get('telegram_id')}</code>\n"
-        f"{username_line}"
-        f"<b>{t('profile_first_name')}:</b> {row.get('first_name') or t('unknown')}\n"
-        f"<b>{t('profile_last_name')}:</b> {row.get('last_name') or t('unknown')}\n"
-        f"<b>{t('profile_language')}:</b> {row.get('preferred_language') or t('unknown')}\n"
-        f"<b>{t('profile_onboarded')}:</b> {t('yes') if row.get('is_onboarded') else t('no')}",
-        parse_mode="HTML",
-        reply_markup=build_main_menu_keyboard(t),
-    )
-
-
-@router.message(lambda m: (m.text or "").strip() in {"❓ Допомога", "❓ Помощь", "❓ Help"})
-async def help_handler(message: Message, telegram_users_repo, i18n_service) -> None:
-    user = message.from_user
-    if user is None:
-        await message.answer("User is undefined.")
-        return
-
-    _, _, t = await _get_lang_and_t(user, telegram_users_repo, i18n_service)
-
-    await message.answer(
-        t("help_text"),
-        parse_mode="HTML",
-        reply_markup=build_main_menu_keyboard(t),
-    )
+@router.message(lambda m: (m.text or "").strip() in {"\u2139\ufe0f \u0414\u043e\u043f\u043e\u043c\u043e\u0433\u0430", "\u2139\ufe0f Help", "\u2139\ufe0f \u041f\u043e\u043c\u043e\u0449\u044c"})
+async def help_message_handler(message: Message, **deps) -> None:
+    await render_help_screen(message, **deps)

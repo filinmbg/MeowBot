@@ -10,6 +10,8 @@ class Side(str, Enum):
 class TradeStatus(str, Enum):
     OPEN = "OPEN"
     CLOSED = "CLOSED"
+    ERROR_INVALID_SYMBOL = "ERROR_INVALID_SYMBOL"
+    DUPLICATE_SUPERSEDED = "DUPLICATE_SUPERSEDED"
 
 
 class SignalAction(str, Enum):

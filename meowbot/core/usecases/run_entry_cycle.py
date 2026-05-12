@@ -12,6 +12,7 @@ from meowbot.core.ports.broker import Broker
 from meowbot.core.services.execution.entry.portfolio_gate import PortfolioGate
 from meowbot.core.ports.account_repo import AccountRepository
 from meowbot.core.services.execution.risk.sizing import PositionSizing
+from meowbot.core.usecases.open_trade import OpenTradeUseCase
 
 
 class RunEntryCycleUseCase:
@@ -36,6 +37,10 @@ class RunEntryCycleUseCase:
         self.account_repo = account_repo                # ← додали
         self.sizing = sizing                            # ← додали
         self.tail_needed = tail_needed
+        self.open_trade_usecase = OpenTradeUseCase(
+            trades_repo=trades_repo,
+            broker=broker,
+        )
     def run(
         self,
         symbol: str,
@@ -98,6 +103,11 @@ class RunEntryCycleUseCase:
             entry_bar_close_time=last_bar.close_time,
         )
 
-        trade = self.broker.open_trade(trade)
-        self.trades_repo.create_trade(trade)
-        return trade.trade_id
+        result = self.open_trade_usecase.execute(
+            trade=trade,
+            max_open_trades_total=self.gate.limits.max_open_trades_total,
+            max_open_trades_per_symbol=self.gate.limits.max_open_trades_per_symbol,
+        )
+        if not result.opened or result.trade is None:
+            return None
+        return result.trade.trade_id

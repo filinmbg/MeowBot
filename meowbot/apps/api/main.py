@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from meowbot.apps.api.action_guard import install_action_guard
 from meowbot.apps.api.routes.settings import router as settings_router
 from meowbot.apps.api.routes.stats import router as stats_router
 from meowbot.apps.api.routes.telegram_auth import router as telegram_auth_router
@@ -11,6 +12,7 @@ from meowbot.infra.mongo.client import MongoConn, MongoConfig
 
 
 app = FastAPI(title="MeowBot API")
+install_action_guard(app)
 
 
 @app.on_event("startup")

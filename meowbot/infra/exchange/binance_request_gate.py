@@ -5,6 +5,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Any, Callable
 
 import httpx
 
@@ -49,17 +50,27 @@ class BinanceRequestGate:
         method: str,
         path: str,
         params: dict | None = None,
+        params_factory: Callable[[], dict[str, Any]] | None = None,
         weight: int = 1,
     ) -> dict | list:
         params = params or {}
         last_exc: Exception | None = None
 
         for attempt in range(1, self.config.retry_attempts + 1):
+            request_params = dict(params)
+            request_started_at_ms = int(time.time() * 1000)
+            request_timestamp_ms: int | None = None
+            request_age_ms: int | None = None
             try:
                 await self._wait_for_slot(weight)
 
                 async with self._sem:
-                    response = await client.request(method, path, params=params)
+                    request_started_at_ms = int(time.time() * 1000)
+                    request_params = params_factory() if callable(params_factory) else dict(params)
+                    request_timestamp_ms = self._extract_request_timestamp(request_params)
+                    if request_timestamp_ms is not None:
+                        request_age_ms = max(0, request_started_at_ms - request_timestamp_ms)
+                    response = await client.request(method, path, params=request_params)
                     await self._handle_response_limits(response)
 
                     response.raise_for_status()
@@ -95,12 +106,32 @@ class BinanceRequestGate:
 
                 if status is not None and 400 <= status < 500:
                     self._last_error = f"{status} on {path}"
-                    log.warning(
-                        "[binance-gate] non-retriable status=%s path=%s params=%s",
-                        status,
-                        path,
-                        params,
-                    )
+                    if self._is_expected_algo_cancel_not_found(
+                        method=method,
+                        path=path,
+                        response=exc.response,
+                    ):
+                        log.info(
+                            "[binance-gate] idempotent cancel not found status=%s path=%s params=%s response=%s",
+                            status,
+                            path,
+                            self._sanitize_params(request_params),
+                            self._safe_response_text(exc.response),
+                        )
+                    else:
+                        error_code = self._extract_binance_error_code(exc.response)
+                        log.warning(
+                            "[binance-gate] non-retriable status=%s path=%s params=%s response=%s code=%s request_age_ms=%s timestamp_ms=%s local_time_ms=%s decision=%s",
+                            status,
+                            path,
+                            self._sanitize_params(request_params),
+                            self._safe_response_text(exc.response),
+                            error_code,
+                            request_age_ms,
+                            request_timestamp_ms,
+                            request_started_at_ms,
+                            "accept" if error_code != -1021 else "retry_or_raise",
+                        )
                     raise
 
                 delay = self._retry_delay(attempt)
@@ -240,3 +271,59 @@ class BinanceRequestGate:
             pass
 
         return None
+
+    def _sanitize_params(self, params: dict | None) -> dict:
+        sanitized = dict(params or {})
+        for key in list(sanitized.keys()):
+            if str(key).lower() in {"signature"}:
+                sanitized[key] = "<redacted>"
+        return sanitized
+
+    def _extract_request_timestamp(self, params: dict[str, Any] | None) -> int | None:
+        if not isinstance(params, dict):
+            return None
+        try:
+            raw = params.get("timestamp")
+            if raw is None:
+                return None
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _is_expected_algo_cancel_not_found(
+        self,
+        *,
+        method: str,
+        path: str,
+        response: httpx.Response | None,
+    ) -> bool:
+        if str(method).upper() != "DELETE":
+            return False
+        if str(path) != "/fapi/v1/algoOrder":
+            return False
+        return self._extract_binance_error_code(response) == -2011
+
+    def _extract_binance_error_code(self, response: httpx.Response | None) -> int | None:
+        if response is None:
+            return None
+        try:
+            payload = response.json()
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return int(payload.get("code"))
+        except Exception:
+            return None
+
+    def _safe_response_text(self, response: httpx.Response | None, *, limit: int = 500) -> str | None:
+        if response is None:
+            return None
+        try:
+            text = str(response.text or "")
+        except Exception:
+            return None
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."

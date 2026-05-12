@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 
+SUPPRESSED_USER_BLOCK_REASONS = {
+    "open_trade_exists_for_symbol",
+    "max_open_trades_per_symbol_exceeded",
+    "risk_limit_reached",
+}
+
+
 class RiskSubscriptionMessageBuilder:
     def build_user_message(self, event_type: str, payload: dict) -> str | None:
         reason = str(payload.get("reason") or "")
         symbol = str(payload.get("symbol") or "")
         tf_entry = str(payload.get("tf_entry") or "")
         current_margin_ratio_pct = payload.get("current_margin_ratio_pct")
+
+        if reason in SUPPRESSED_USER_BLOCK_REASONS:
+            return None
 
         if event_type == "ENTRY_BLOCKED_SUBSCRIPTION":
             if reason == "symbol_not_allowed":
@@ -27,12 +37,15 @@ class RiskSubscriptionMessageBuilder:
                 return (
                     f"⛔ <b>Трейд не відкрито</b>\n\n"
                     f"🪙 <b>{symbol}</b> · {tf_entry}\n"
-                    f"Причина: досягнуто ліміт одночасно відкритих угод."
+                    f"Причина: досягнуто ліміт відкритих трейдів для вашого тарифу."
                 )
 
-            # Прибрали повідомлення юзеру:
-            if reason == "max_open_trades_per_symbol_exceeded":
-                return None
+            if reason in {"max_open_trades_per_symbol_exceeded", "open_trade_exists_for_symbol"}:
+                return (
+                    f"⛔ <b>Трейд не відкрито</b>\n\n"
+                    f"🪙 <b>{symbol}</b> · {tf_entry}\n"
+                    f"Причина: по цій монеті вже є відкритий трейд."
+                )
 
             if reason == "long_disabled":
                 return (
@@ -42,6 +55,14 @@ class RiskSubscriptionMessageBuilder:
                 )
 
         if event_type == "ENTRY_BLOCKED_RISK":
+            if reason == "risk_limit_reached":
+                return (
+                    f"⛔ <b>Трейд не відкрито</b>\n\n"
+                    f"🪙 <b>{symbol}</b> · {tf_entry}\n"
+                    f"Причина: досягнуто глобальний ризик-ліміт (5 активних ризикових трейдів).\n"
+                    f"Дочекайтесь спрацювання TP1 по існуючих позиціях."
+                )
+
             if reason == "margin_ratio_blocked":
                 ratio_text = (
                     f"{float(current_margin_ratio_pct):.2f}%"

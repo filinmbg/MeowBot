@@ -1,31 +1,30 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import asyncpg
-from dotenv import load_dotenv
 
 
-ROOT = Path(__file__).resolve().parents[3]
-load_dotenv(ROOT / ".env")
+async def get_pg_pool() -> asyncpg.Pool:
+    dsn = (
+        os.getenv("POSTGRES_URL")
+        or os.getenv("DATABASE_URL")
+        or os.getenv("PG_DSN")
+    )
+    if not dsn:
+        raise RuntimeError("POSTGRES_URL, DATABASE_URL, or PG_DSN is not set")
 
-
-async def get_pg_pool():
-    dsn = os.getenv("PG_DSN")
-    if dsn:
-        return await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=1,
-            max_size=10,
-        )
+    min_size = int(os.getenv("PG_POOL_MIN_SIZE", "1"))
+    max_size = int(os.getenv("PG_POOL_MAX_SIZE", "2"))
+    command_timeout = float(os.getenv("PG_COMMAND_TIMEOUT", "30"))
+    max_inactive_connection_lifetime = float(
+        os.getenv("PG_MAX_INACTIVE_CONNECTION_LIFETIME", "30")
+    )
 
     return await asyncpg.create_pool(
-        host=os.getenv("PG_HOST", "localhost"),
-        port=int(os.getenv("PG_PORT", 5432)),
-        user=os.getenv("PG_USER", "postgres"),
-        password=os.getenv("PG_PASSWORD", "postgres"),
-        database=os.getenv("PG_DB", "meowbot"),
-        min_size=1,
-        max_size=10,
+        dsn=dsn,
+        min_size=min_size,
+        max_size=max_size,
+        command_timeout=command_timeout,
+        max_inactive_connection_lifetime=max_inactive_connection_lifetime,
     )

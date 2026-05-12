@@ -193,7 +193,7 @@ def test_get_global_stats() -> None:
                 tf="1h",
                 model_id="OTHER_RULE",
                 status=TradeStatus.OPEN,
-                pnl=0.0,
+                pnl=2.5,
             ),
         ]
     )
@@ -206,4 +206,4 @@ def test_get_global_stats() -> None:
     assert stats["total_trades"] == 3
     assert stats["closed_trades"] == 2
     assert stats["open_trades"] == 1
-    assert stats["net_profit_usd"] == 10.0
+    assert stats["net_profit_usd"] == 12.5

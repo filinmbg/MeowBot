@@ -3,6 +3,10 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from meowbot.core.configs.strategy_version_test_users import (
+    expand_strategy_version_test_user_emails,
+)
+
 
 class SendAdminTestUsersSummaryUseCase:
     def __init__(
@@ -22,7 +26,7 @@ class SendAdminTestUsersSummaryUseCase:
         self.bot = bot
         self.message_builder = message_builder
         self.admin_chat_ids = admin_chat_ids
-        self.test_user_emails = [x.strip().lower() for x in test_user_emails if x.strip()]
+        self.test_user_emails = expand_strategy_version_test_user_emails(test_user_emails)
         self.sandbox_start_balance_usd = float(sandbox_start_balance_usd)
         self.risk_period_hours = int(risk_period_hours)
 
@@ -38,6 +42,11 @@ class SendAdminTestUsersSummaryUseCase:
         trade_summary = await self.admin_trade_stats_repo.get_trade_summary_by_user_ids(
             user_ids=runtime_user_ids,
         )
+        strategy_summary_rows = []
+        if hasattr(self.admin_trade_stats_repo, "get_strategy_summary_by_user_ids"):
+            strategy_summary_rows = await self.admin_trade_stats_repo.get_strategy_summary_by_user_ids(
+                user_ids=runtime_user_ids,
+            )
 
         ts_from_ms = int(time.time() * 1000) - self.risk_period_hours * 60 * 60 * 1000
         risk_blocks = await self.admin_trade_stats_repo.count_risk_blocks_since(
@@ -80,6 +89,7 @@ class SendAdminTestUsersSummaryUseCase:
         text = self.message_builder.build(
             rows,
             period_hours=self.risk_period_hours,
+            strategy_summary_rows=strategy_summary_rows,
         )
 
         sent = 0

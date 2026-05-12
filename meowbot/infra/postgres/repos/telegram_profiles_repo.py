@@ -9,6 +9,28 @@ class TelegramProfilesRepo:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self.pool = pool
 
+    async def get_by_user_id(self, user_id) -> dict[str, Any] | None:
+        query = """
+        select
+            id,
+            user_id,
+            telegram_id,
+            username,
+            first_name,
+            last_name,
+            chat_id,
+            is_onboarded,
+            last_seen_at,
+            created_at,
+            updated_at
+        from telegram_profiles
+        where user_id = $1
+        limit 1
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, user_id)
+        return dict(row) if row else None
+
     async def upsert_profile(
         self,
         *,

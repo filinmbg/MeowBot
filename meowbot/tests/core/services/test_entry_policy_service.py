@@ -59,7 +59,7 @@ def test_regular_user_blocked_by_same_symbol() -> None:
     )
 
     assert decision.allowed is False
-    assert decision.reason == "regular_user_has_open_trade_for_symbol"
+    assert decision.reason == "open_trade_exists_for_symbol"
     assert decision.conflict_trade_id == "t1"
 
 
@@ -111,11 +111,11 @@ def test_test_user_blocked_on_same_symbol_tf_rule() -> None:
     )
 
     assert decision.allowed is False
-    assert decision.reason == "test_user_duplicate_symbol_tf_rule"
+    assert decision.reason == "open_trade_exists_for_symbol"
     assert decision.conflict_trade_id == "t1"
 
 
-def test_test_user_allowed_on_same_symbol_other_tf() -> None:
+def test_test_user_blocked_on_same_symbol_other_tf() -> None:
     service = EntryPolicyService(test_user_ids={"demo_user"})
 
     open_trades = [
@@ -136,11 +136,12 @@ def test_test_user_allowed_on_same_symbol_other_tf() -> None:
         open_trades=open_trades,
     )
 
-    assert decision.allowed is True
-    assert decision.reason == "allowed"
+    assert decision.allowed is False
+    assert decision.reason == "open_trade_exists_for_symbol"
+    assert decision.conflict_trade_id == "t1"
 
 
-def test_test_user_allowed_on_same_symbol_tf_other_rule() -> None:
+def test_test_user_blocked_on_same_symbol_tf_other_rule() -> None:
     service = EntryPolicyService(test_user_ids={"demo_user"})
 
     open_trades = [
@@ -161,5 +162,6 @@ def test_test_user_allowed_on_same_symbol_tf_other_rule() -> None:
         open_trades=open_trades,
     )
 
-    assert decision.allowed is True
-    assert decision.reason == "allowed"
+    assert decision.allowed is False
+    assert decision.reason == "open_trade_exists_for_symbol"
+    assert decision.conflict_trade_id == "t1"

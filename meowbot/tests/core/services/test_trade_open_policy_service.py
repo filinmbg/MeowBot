@@ -19,6 +19,33 @@ def test_test_user_allows_multiple_rules():
     assert decision.allowed is True
 
 
+def test_test_user_blocks_second_trade_on_same_symbol_other_rule():
+    policy = TradeOpenPolicyService()
+
+    active = [
+        ActiveTradeRef(
+            trade_id="1",
+            user_id="1",
+            symbol="BTCUSDT",
+            timeframe="1h",
+            rule_id="rule_1",
+        )
+    ]
+
+    decision = policy.can_open_trade(
+        user_id="1",
+        symbol="BTCUSDT",
+        timeframe="4h",
+        rule_id="rule_2",
+        is_test_user=True,
+        active_trades=active,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "open_trade_exists_for_symbol"
+    assert decision.conflict_trade_id == "1"
+
+
 def test_regular_user_blocks_second_trade():
     policy = TradeOpenPolicyService()
 
@@ -42,3 +69,4 @@ def test_regular_user_blocks_second_trade():
     )
 
     assert decision.allowed is False
+    assert decision.reason == "open_trade_exists_for_symbol"

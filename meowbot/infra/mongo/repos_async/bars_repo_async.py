@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any
 
 from pymongo import UpdateOne
@@ -81,9 +82,12 @@ class BarsRepositoryMongoAsync:
         await self._col(bars[0].tf).bulk_write(ops, ordered=False)
 
     def _to_doc(self, bar: Bar) -> dict[str, Any]:
-        return asdict(bar)
+        doc = asdict(bar)
+        doc.setdefault("created_at_dt", datetime.now(timezone.utc))
+        return doc
 
     def _from_doc(self, doc: dict[str, Any]) -> Bar:
         data = dict(doc)
         data.pop("_id", None)
+        data.pop("created_at_dt", None)
         return Bar(**data)

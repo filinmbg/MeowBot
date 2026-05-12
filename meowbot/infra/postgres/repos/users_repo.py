@@ -9,6 +9,35 @@ class UsersRepo:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self.pool = pool
 
+    async def get_by_id(self, user_id) -> dict[str, Any] | None:
+        query = """
+        select
+            u.id,
+            u.email,
+            u.display_name,
+            u.role,
+            u.status,
+            u.preferred_language,
+            u.created_at,
+            u.updated_at,
+
+            tp.telegram_id,
+            tp.username,
+            tp.first_name,
+            tp.last_name,
+            tp.chat_id,
+            tp.is_onboarded,
+            tp.last_seen_at
+        from users u
+        left join telegram_profiles tp
+            on tp.user_id = u.id
+        where u.id = $1
+        limit 1
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, user_id)
+        return dict(row) if row else None
+
     async def create(
         self,
         *,
@@ -75,4 +104,32 @@ class UsersRepo:
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(query, int(telegram_id))
+        return dict(row) if row else None
+
+    async def set_preferred_language_by_telegram_id(
+        self,
+        telegram_id: int,
+        language: str,
+    ) -> dict[str, Any] | None:
+        query = """
+        update users u
+        set
+            preferred_language = $2,
+            updated_at = now()
+        from telegram_profiles tp
+        where
+            tp.user_id = u.id
+            and tp.telegram_id = $1
+        returning
+            u.id,
+            u.email,
+            u.display_name,
+            u.role,
+            u.status,
+            u.preferred_language,
+            u.created_at,
+            u.updated_at
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(query, int(telegram_id), language)
         return dict(row) if row else None

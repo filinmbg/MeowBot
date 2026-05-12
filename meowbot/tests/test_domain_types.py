@@ -47,3 +47,8 @@ def test_trade_defaults():
     assert t.remaining_pct == 1.0
     assert t.tp_hit_count == 0
     assert t.status == TradeStatus.OPEN
+    assert t.is_open is True
+    assert t.tp1_hit is False
+    assert t.tp2_hit is False
+    assert t.tp3_hit is False
+    assert t.closed is False

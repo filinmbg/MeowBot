@@ -165,17 +165,20 @@ def build_short_breakdown_mask(df: pd.DataFrame) -> pd.Series:
         & vol_peak_offset.notna()
     )
 
+    # SHORT BREAKDOWN V2:
+    # жорсткіший breakdown: менше шуму, сильніше закриття вниз,
+    # але всі стратегії/TP/таймфрейми залишаються в тесті.
     return (
         valid
-        & (rsi14 <= 45)
-        & (dist_ema50 <= -1.0)
-        & (dist_ema50 >= -4.0)
-        & (volume_ratio >= 1.5)
+        & (rsi14 <= 42)
+        & (dist_ema50 <= -1.2)
+        & (dist_ema50 >= -3.5)
+        & (volume_ratio >= 1.7)
         & (atr14_pct >= 0.4)
-        & (atr14_pct <= 1.2)
-        & (vol_peak_offset >= -4)
-        & (close_pos <= 0.55)
-        & (adx14 >= 20)
+        & (atr14_pct <= 1.0)
+        & (vol_peak_offset >= -3)
+        & (close_pos <= 0.50)
+        & (adx14 >= 22)
     ).fillna(False)
 
 
@@ -196,17 +199,20 @@ def build_short_rejection_mask(df: pd.DataFrame) -> pd.Series:
         & close_pos.notna()
     )
 
+    # SHORT REJECTION V2:
+    # тепер це справжній rejection: ціна була високо,
+    # але свічка закрилась слабко.
     return (
         valid
-        & (rsi14 >= 58)
-        & (rsi14 <= 75)
-        & (dist_ema50 >= 1.2)
-        & (dist_ema50 <= 4.5)
-        & (volume_ratio >= 1.2)
-        & (atr14_pct >= 0.3)
-        & (atr14_pct <= 1.2)
-        & (close_pos <= 0.60)
-        & (adx14 >= 18)
+        & (rsi14 >= 62)
+        & (rsi14 <= 72)
+        & (dist_ema50 >= 1.5)
+        & (dist_ema50 <= 4.0)
+        & (volume_ratio >= 1.5)
+        & (atr14_pct >= 0.4)
+        & (atr14_pct <= 1.0)
+        & (close_pos <= 0.45)
+        & (adx14 >= 20)
     ).fillna(False)
 
 
@@ -227,17 +233,19 @@ def build_short_pullback_mask(df: pd.DataFrame) -> pd.Series:
         & close_pos.notna()
     )
 
+    # SHORT PULLBACK V2:
+    # звужений pullback: відскок у зону EMA, але без сильного bullish-закриття.
     return (
         valid
-        & (rsi14 >= 45)
-        & (rsi14 <= 60)
-        & (dist_ema50 >= -0.5)
-        & (dist_ema50 <= 1.5)
-        & (volume_ratio >= 1.2)
-        & (atr14_pct >= 0.3)
-        & (atr14_pct <= 1.0)
-        & (close_pos <= 0.55)
-        & (adx14 >= 18)
+        & (rsi14 >= 48)
+        & (rsi14 <= 58)
+        & (dist_ema50 >= -0.2)
+        & (dist_ema50 <= 1.2)
+        & (volume_ratio >= 1.5)
+        & (atr14_pct >= 0.35)
+        & (atr14_pct <= 0.9)
+        & (close_pos <= 0.45)
+        & (adx14 >= 20)
     ).fillna(False)
 
 

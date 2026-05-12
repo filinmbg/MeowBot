@@ -4,7 +4,7 @@ from meowbot.apps.telegram_bot.i18n.locales import LOCALES
 
 
 SUPPORTED_LANGUAGES = {"uk", "ru", "en"}
-DEFAULT_LANGUAGE = "uk"
+DEFAULT_LANGUAGE = "en"
 
 
 class I18nService:
@@ -31,7 +31,12 @@ class I18nService:
 
     def t(self, lang: str, key: str, **kwargs) -> str:
         language = self.normalize_language(lang)
-        text = LOCALES.get(language, LOCALES[DEFAULT_LANGUAGE]).get(key, key)
+        locale = LOCALES.get(language, LOCALES[DEFAULT_LANGUAGE])
+        text = locale.get(key)
+        if text is None and language != DEFAULT_LANGUAGE:
+            text = LOCALES[DEFAULT_LANGUAGE].get(key)
+        if text is None:
+            text = key
         if kwargs:
             return text.format(**kwargs)
         return text

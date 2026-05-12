@@ -1,76 +1,55 @@
 from __future__ import annotations
 
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 
-def build_main_menu_keyboard(t) -> ReplyKeyboardMarkup:
+def build_main_menu_keyboard(t, *, is_admin: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=t("reply.home")), KeyboardButton(text=t("reply.plan"))],
+        [KeyboardButton(text=t("reply.trades")), KeyboardButton(text=t("reply.settings"))],
+        [KeyboardButton(text=t("reply.help"))],
+    ]
+    if is_admin:
+        rows.append([KeyboardButton(text=t("reply.admin"))])
+
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text=t("btn_my_bot")),
-                KeyboardButton(text=t("btn_stats")),
-            ],
-            [
-                KeyboardButton(text=t("btn_trades")),
-                KeyboardButton(text=t("btn_settings")),
-            ],
-            [
-                KeyboardButton(text=t("btn_profile")),
-                KeyboardButton(text=t("btn_help")),
-            ],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="...",
+        input_field_placeholder=t("common.placeholder"),
     )
 
 
 def build_onboarding_keyboard(t) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=t("btn_start"))],
-        ],
+        keyboard=[[KeyboardButton(text=t("start.button"))]],
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="...",
+        input_field_placeholder=t("common.placeholder"),
     )
 
 
-def build_back_menu_keyboard(t) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=t("btn_back")), KeyboardButton(text=t("btn_menu"))],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="...",
-    )
-
-
-def build_settings_keyboard(t) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=t("btn_language")), KeyboardButton(text=t("btn_mode"))],
-            [KeyboardButton(text=t("btn_stake")), KeyboardButton(text=t("btn_leverage"))],
-            [KeyboardButton(text=t("btn_notifications"))],
-            [KeyboardButton(text=t("btn_back")), KeyboardButton(text=t("btn_menu"))],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="...",
-    )
-
-
-def build_bot_control_keyboard(t, *, enabled: bool) -> ReplyKeyboardMarkup:
-    toggle_text = (
-        "🔴 Вимкнути бота" if enabled else "🟢 Увімкнути бота"
-    )
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=toggle_text)],
-            [KeyboardButton(text=t("btn_back")), KeyboardButton(text=t("btn_menu"))],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="...",
+def build_home_keyboard(t) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=t("reply.plan"), callback_data="plan:show"),
+                InlineKeyboardButton(text=t("reply.trades"), callback_data="trades:show"),
+            ],
+            [
+                InlineKeyboardButton(text=t("reply.settings"), callback_data="settings:show"),
+                InlineKeyboardButton(text=f"🔑 {t('settings.api')}", callback_data="api:show"),
+            ],
+            [
+                InlineKeyboardButton(text=t("home.start_balance_button"), callback_data="risk:sandbox_start_balance"),
+            ],
+            [
+                InlineKeyboardButton(text=t("common.refresh"), callback_data="nav:refresh:home"),
+            ],
+        ]
     )

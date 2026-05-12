@@ -33,6 +33,19 @@ def _make_closed_trade(*, user_id: str, pnl: float) -> Trade:
     )
 
 
+def _make_open_trade(*, user_id: str, pnl: float) -> Trade:
+    trade = _make_closed_trade(user_id=user_id, pnl=pnl)
+    return Trade(
+        **{
+            **trade.__dict__,
+            "trade_id": f"{user_id}:open:{pnl}",
+            "status": TradeStatus.OPEN,
+            "remaining_pct": 0.3,
+            "qty_remaining": 0.3,
+        }
+    )
+
+
 def test_percent_mode_uses_one_percent_of_balance() -> None:
     service = SandboxPositionSizingService(
         SandboxTradingConfig(
@@ -70,6 +83,7 @@ def test_percent_mode_updates_balance_after_closed_trades() -> None:
     trades = [
         _make_closed_trade(user_id="demo_user", pnl=50.0),
         _make_closed_trade(user_id="demo_user", pnl=-20.0),
+        _make_open_trade(user_id="demo_user", pnl=5.0),
     ]
 
     result = service.calculate(
@@ -78,8 +92,8 @@ def test_percent_mode_updates_balance_after_closed_trades() -> None:
         trades=trades,
     )
 
-    assert result.current_balance_usd == 1030.0
-    assert result.stake_usd == 10.3
+    assert result.current_balance_usd == 1035.0
+    assert result.stake_usd == 10.35
 
 
 def test_fixed_mode_uses_fixed_stake() -> None:

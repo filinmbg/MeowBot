@@ -48,7 +48,7 @@ def test_stats_for_user() -> None:
     trades = [
         _make_trade(trade_id="1", user_id="demo_user", status=TradeStatus.CLOSED, pnl=20.0),
         _make_trade(trade_id="2", user_id="demo_user", status=TradeStatus.CLOSED, pnl=-10.0),
-        _make_trade(trade_id="3", user_id="demo_user", status=TradeStatus.OPEN, pnl=0.0),
+        _make_trade(trade_id="3", user_id="demo_user", status=TradeStatus.OPEN, pnl=2.5),
         _make_trade(trade_id="4", user_id="other_user", status=TradeStatus.CLOSED, pnl=100.0),
     ]
 
@@ -60,8 +60,8 @@ def test_stats_for_user() -> None:
     assert stats.wins == 1
     assert stats.losses == 1
     assert stats.winrate_pct == 50.0
-    assert stats.net_profit_usd == 10.0
-    assert stats.current_balance_usd == 1010.0
+    assert stats.net_profit_usd == 12.5
+    assert stats.current_balance_usd == 1012.5
     assert stats.gross_profit_usd == 20.0
     assert stats.gross_loss_usd == -10.0
     assert stats.profit_factor == 2.0

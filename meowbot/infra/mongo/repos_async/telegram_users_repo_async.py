@@ -116,8 +116,8 @@ class TelegramUsersRepositoryMongoAsync:
                 "is_onboarded": True,
                 "bot_enabled": True,
             }
-        ).sort("created_at", 1)
-        return await cursor.to_list(length=10_000)
+        ).sort("created_at", 1).limit(1000)
+        return await cursor.to_list(length=1000)
 
     async def resolve_notification_target_by_user_id(self, user_id: str) -> dict[str, Any] | None:
         row = await self.get_by_trading_user_id(user_id)
@@ -127,6 +127,7 @@ class TelegramUsersRepositoryMongoAsync:
         return {
             "telegram_id": row.get("telegram_id"),
             "chat_id": row.get("chat_id"),
+            "email": row.get("email"),
             "preferred_language": row.get("preferred_language", "uk"),
             "notifications_enabled": bool(row.get("notifications_enabled", True)),
             "bot_enabled": bool(row.get("bot_enabled", True)),

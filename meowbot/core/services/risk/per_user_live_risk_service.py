@@ -30,11 +30,13 @@ class PerUserLiveRiskService:
         entry_price: float,
         default_stake_mode: str,
         default_stake_value: float,
+        min_entry_margin_usdt: float,
         default_leverage: int,
         max_margin_per_trade_mode: str,
         max_margin_per_trade_value: float,
         margin_ratio_warn_pct: float,
         margin_ratio_block_pct: float,
+        position_size_multiplier: float = 1.0,
     ) -> LiveEntryRiskResult:
         key_row = await self.user_api_keys_repo.get_active_key_by_runtime_user_id(
             runtime_user_id=runtime_user_id,
@@ -74,6 +76,7 @@ class PerUserLiveRiskService:
             risk_service = LiveAccountRiskService(
                 account_info_provider=client.get_account_info,
                 symbol_max_leverage_provider=client.get_symbol_max_leverage,
+                symbol_trading_rules_provider=client.get_symbol_trading_rules,
                 margin_buffer_ratio=0.98,
             )
 
@@ -82,11 +85,13 @@ class PerUserLiveRiskService:
                 entry_price=entry_price,
                 default_stake_mode=default_stake_mode,
                 default_stake_value=default_stake_value,
+                min_entry_margin_usdt=min_entry_margin_usdt,
                 default_leverage=default_leverage,
                 max_margin_per_trade_mode=max_margin_per_trade_mode,
                 max_margin_per_trade_value=max_margin_per_trade_value,
                 margin_ratio_warn_pct=margin_ratio_warn_pct,
                 margin_ratio_block_pct=margin_ratio_block_pct,
+                position_size_multiplier=position_size_multiplier,
             )
         finally:
             await client.close()

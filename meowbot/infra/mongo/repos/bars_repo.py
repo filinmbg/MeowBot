@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from pymongo import ASCENDING, DESCENDING, UpdateOne
@@ -13,10 +14,14 @@ from meowbot.infra.mongo.migrations import bars_collection_name
 
 def _bar_to_doc(b: Bar) -> dict:
     # зберігаємо як звичайний dict
-    return asdict(b)
+    doc = asdict(b)
+    doc.setdefault("created_at_dt", datetime.now(timezone.utc))
+    return doc
 
 
 def _doc_to_bar(doc: dict) -> Bar:
+    doc = dict(doc)
+    doc.pop("created_at_dt", None)
     return Bar(**doc)
 
 

@@ -23,12 +23,16 @@ class AdminTestUsersRepo:
                 us.is_trial,
                 us.ends_at,
                 sp.code as plan_code,
-                sp.name as plan_name
+                sp.name as plan_name,
+                coalesce(us.strategy_version, 'v1') as strategy_version
             from user_subscriptions us
             join subscription_plans sp
                 on sp.id = us.plan_id
             where us.status = 'active'
             order by us.user_id, us.created_at desc
+        ),
+        requested_emails as (
+            select unnest($1::text[]) as email
         )
         select
             u.id as user_id,
@@ -44,6 +48,7 @@ class AdminTestUsersRepo:
             active_sub.plan_id,
             active_sub.plan_code,
             active_sub.plan_name,
+            coalesce(active_sub.strategy_version, 'v1') as strategy_version,
             active_sub.is_trial,
             active_sub.ends_at
         from users u
@@ -53,8 +58,36 @@ class AdminTestUsersRepo:
             on ts.user_id = u.id
         left join active_sub
             on active_sub.user_id = u.id
-        where lower(u.email) = any($1::text[])
-        order by u.email asc
+        where lower(u.email) in (select email from requested_emails)
+           or lower(coalesce(u.email, '')) like '%\\_test\\_v2@example.com'
+           or lower(coalesce(tp.username, '')) like '%\\_test\\_v2'
+           or (
+                (
+                    coalesce(active_sub.strategy_version, 'v1') = 'v2'
+                    or lower(coalesce(active_sub.plan_code, '')) like '%\\_v2'
+                )
+                and (
+                    lower(coalesce(u.email, '')) like '%test%'
+                    or lower(coalesce(tp.username, '')) like '%test%'
+                )
+           )
+        order by
+            case
+                when coalesce(active_sub.strategy_version, 'v1') = 'v2'
+                  or lower(coalesce(active_sub.plan_code, '')) like '%\\_v2'
+                  or lower(coalesce(u.email, '')) like '%\\_test\\_v2@example.com'
+                  or lower(coalesce(tp.username, '')) like '%\\_test\\_v2'
+                    then 2
+                else 1
+            end,
+            case regexp_replace(lower(coalesce(active_sub.plan_code, 'unknown')), '_v2$', '')
+                when 'free' then 1
+                when 'basic' then 2
+                when 'pro' then 3
+                when 'vip' then 4
+                else 99
+            end,
+            u.email asc
         """
         normalized = [x.strip().lower() for x in emails if x.strip()]
         async with self.pool.acquire() as conn:

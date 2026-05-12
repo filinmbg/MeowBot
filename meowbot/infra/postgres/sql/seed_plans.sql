@@ -31,7 +31,7 @@ VALUES
     19.99,
     30,
     '{
-      "max_symbols": 20,
+      "max_symbols": 50,
       "max_open_trades_total": 5,
       "max_open_trades_per_symbol": 1,
       "sandbox_enabled": true,

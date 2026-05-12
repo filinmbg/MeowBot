@@ -37,8 +37,8 @@ VALUES
     0.00,
     3,
     '{
-      "max_symbols": 20,
-      "max_open_trades_total": 3,
+      "max_symbols": 50,
+      "max_open_trades_total": 5,
       "max_open_trades_per_symbol": 1,
       "sandbox_enabled": true,
       "live_enabled": true,
@@ -75,7 +75,7 @@ VALUES
     49.99,
     30,
     '{
-      "max_symbols": 20,
+      "max_symbols": 100,
       "max_open_trades_total": 20,
       "max_open_trades_per_symbol": 1,
       "sandbox_enabled": true,
@@ -92,8 +92,8 @@ VALUES
     99.99,
     30,
     '{
-      "max_symbols": 50,
-      "max_open_trades_total": 50,
+      "max_symbols": 150,
+      "max_open_trades_total": null,
       "max_open_trades_per_symbol": 1,
       "sandbox_enabled": true,
       "live_enabled": true,

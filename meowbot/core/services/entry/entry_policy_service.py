@@ -40,36 +40,23 @@ class EntryPolicyService:
         rule_id: str,
         open_trades: Iterable[Trade],
     ) -> EntryPolicyDecision:
-        is_test_user = self.is_test_user(user_id)
+        normalized_symbol = symbol.upper()
 
         for trade in open_trades:
             if not self._is_open(trade):
                 continue
 
-            if trade.symbol != symbol:
+            if trade.user_id != user_id:
                 continue
 
-            if is_test_user:
-                if trade.user_id != user_id:
-                    continue
+            if trade.symbol.upper() != normalized_symbol:
+                continue
 
-                trade_rule_id = self._trade_rule_id(trade)
-
-                if trade.tf_entry == tf and trade_rule_id == rule_id:
-                    return EntryPolicyDecision(
-                        allowed=False,
-                        reason="test_user_duplicate_symbol_tf_rule",
-                        conflict_trade_id=trade.trade_id,
-                    )
-            else:
-                if trade.user_id != user_id:
-                    continue
-
-                return EntryPolicyDecision(
-                    allowed=False,
-                    reason="regular_user_has_open_trade_for_symbol",
-                    conflict_trade_id=trade.trade_id,
-                )
+            return EntryPolicyDecision(
+                allowed=False,
+                reason="open_trade_exists_for_symbol",
+                conflict_trade_id=trade.trade_id,
+            )
 
         return EntryPolicyDecision(
             allowed=True,
@@ -81,5 +68,3 @@ class EntryPolicyService:
         status = trade.status.value if hasattr(trade.status, "value") else str(trade.status)
         return status == TradeStatus.OPEN.value if hasattr(TradeStatus.OPEN, "value") else status == "OPEN"
 
-    def _trade_rule_id(self, trade: Trade) -> str:
-        return trade.model_id or "unknown_rule"

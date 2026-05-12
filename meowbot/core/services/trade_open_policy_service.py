@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 
 class ActiveTradeRef(BaseModel):
@@ -53,26 +53,6 @@ class TradeOpenPolicyService:
             if trade.status.lower() == "open"
         ]
 
-        if is_test_user:
-            for trade in open_trades:
-                if (
-                    trade.user_id == user_id
-                    and trade.symbol.upper() == symbol.upper()
-                    and trade.timeframe == timeframe
-                    and trade.rule_id == rule_id
-                ):
-                    return TradeOpenDecision(
-                        allowed=False,
-                        reason="test_user_duplicate_rule_timeframe_symbol",
-                        conflict_trade_id=trade.trade_id,
-                    )
-
-            return TradeOpenDecision(
-                allowed=True,
-                reason="allowed_for_test_user",
-                conflict_trade_id=None,
-            )
-
         for trade in open_trades:
             if (
                 trade.user_id == user_id
@@ -80,12 +60,12 @@ class TradeOpenPolicyService:
             ):
                 return TradeOpenDecision(
                     allowed=False,
-                    reason="regular_user_has_open_trade_for_symbol",
+                    reason="open_trade_exists_for_symbol",
                     conflict_trade_id=trade.trade_id,
                 )
 
         return TradeOpenDecision(
             allowed=True,
-            reason="allowed_for_regular_user",
+            reason="allowed",
             conflict_trade_id=None,
         )

@@ -26,6 +26,7 @@ from meowbot.core.services.entry.rsi_rebound_supertrend_detector import (
 from meowbot.core.services.entry.sandbox_position_sizing_service import (
     SandboxPositionSizingService,
 )
+from meowbot.core.usecases.open_trade import OpenTradeUseCase
 
 log = logging.getLogger("meowbot")
 
@@ -59,6 +60,10 @@ class OnlineEntryCycleUseCase:
         self.entry_policy = EntryPolicyService(test_user_ids={"demo_user"})
         self.sizing_service = SandboxPositionSizingService(
             DEFAULT_SANDBOX_TRADING_CONFIG
+        )
+        self.open_trade_usecase = OpenTradeUseCase(
+            trades_repo=trades_repo,
+            broker=broker,
         )
 
     def _cursor_key(self, symbol: str, tf: str) -> str:
@@ -325,8 +330,21 @@ class OnlineEntryCycleUseCase:
             result=result,
         )
 
-        trade = self.broker.open_position(trade)
-        self.trades_repo.create_trade(trade)
+        open_result = self.open_trade_usecase.execute(
+            trade=trade,
+            max_open_trades_total=self.gate.limits.max_open_trades_total,
+            max_open_trades_per_symbol=self.gate.limits.max_open_trades_per_symbol,
+        )
+        if not open_result.opened or open_result.trade is None:
+            log.info(
+                "[entry] %s %s: open blocked by trade manager reason=%s",
+                symbol,
+                tf,
+                open_result.check.reason,
+            )
+            return
+
+        trade = open_result.trade
 
         self.trade_events_repo.add_event(
             trade_id=trade.trade_id,

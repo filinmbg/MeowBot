@@ -98,6 +98,32 @@ class TradeEntryCooldownsRepo:
         async with self.pool.acquire() as conn:
             await conn.execute(query, runtime_user_id, symbol.upper(), reason)
 
+    async def list_active_by_runtime_user_id(
+        self,
+        *,
+        runtime_user_id: str,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        query = """
+        select
+            id,
+            user_id,
+            runtime_user_id,
+            symbol,
+            reason,
+            cooldown_until,
+            created_at,
+            updated_at
+        from trade_entry_cooldowns
+        where runtime_user_id = $1
+          and cooldown_until > now()
+        order by cooldown_until asc
+        limit $2
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(query, runtime_user_id, int(limit))
+        return [dict(row) for row in rows]
+
     @staticmethod
     def utc_now() -> datetime:
         return datetime.now(timezone.utc)

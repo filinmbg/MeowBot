@@ -9,6 +9,7 @@ meowbot/infra/postgres/sql/
 ├── README.md
 ├── reset.sql
 ├── init.sql
+├── create_manual_payments_tables.sql
 ├── seed_plans.sql
 ├── seed_dev.sql
 └── debug_queries.sql
@@ -38,6 +39,19 @@ init.sql
 view для роботи системи
 
 Це основний файл схеми.
+
+create_manual_payments_tables.sql
+
+Додає й розширює все потрібне для ручних USDT TRC20 оплат:
+
+purchase_intents
+payments (нові manual-payment поля і статуси)
+manual_payment_submissions
+promo_codes
+promo_code_redemptions
+розширені status/source constraints для user_subscriptions
+
+Цей файл потрібно запускати поверх вже існуючої актуальної схеми.
 
 seed_plans.sql
 
@@ -87,6 +101,8 @@ seed_plans.sql
 seed_dev.sql
 Якщо схема вже створена, але треба оновити тарифи
 seed_plans.sql
+Якщо треба увімкнути ручні підписки й промокоди на вже існуючій базі
+create_manual_payments_tables.sql
 Якщо треба лише тестового користувача
 seed_dev.sql
 

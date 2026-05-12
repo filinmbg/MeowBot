@@ -51,7 +51,7 @@ class BotViewsMessageBuilder:
         closed_lines: list[str] = []
         for trade in recent_closed[:5]:
             side = self._side_label(lang, str(trade.get("side", "LONG")))
-            pnl = float(trade.get("realized_pnl_usd", 0.0) or 0.0)
+            pnl = self._realized_pnl(trade)
             close_reason = trade.get("close_reason") or labels["unknown"]
             closed_lines.append(
                 f"• <b>{trade.get('symbol', '-')}</b> | {side} | {trade.get('tf_entry', '-')}\n"
@@ -77,6 +77,21 @@ class BotViewsMessageBuilder:
             return f"{float(value):.{digits}f}"
         except Exception:
             return str(value)
+
+    def _realized_pnl(self, trade: dict) -> float:
+        try:
+            exchange_pnl = trade.get("exchange_net_realized_pnl_usd")
+            if exchange_pnl is None:
+                exchange_pnl = trade.get("exchange_net_realized_pnl_usdt")
+            if exchange_pnl is None:
+                exchange_pnl = trade.get("exchange_realized_pnl_usd")
+            if exchange_pnl is None:
+                exchange_pnl = trade.get("exchange_realized_pnl_usdt")
+            if str(trade.get("mode") or "").lower() == "live" and exchange_pnl is not None:
+                return float(exchange_pnl or 0.0)
+            return float(trade.get("realized_pnl_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _side_label(self, lang: str, side: str) -> str:
         labels = self._labels(lang)

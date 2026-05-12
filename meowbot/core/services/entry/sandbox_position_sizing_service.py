@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from meowbot.core.configs.sandbox_trading import SandboxTradingConfig
-from meowbot.core.domain.enums import TradeStatus
 from meowbot.core.domain.types import Trade
 
 
@@ -54,10 +53,8 @@ class SandboxPositionSizingService:
             if trade.user_id != user_id:
                 continue
 
-            status = trade.status.value if hasattr(trade.status, "value") else str(trade.status)
-            if status != TradeStatus.CLOSED.value:
-                continue
-
+            # TP1/TP2 close part of the position, so their realized PnL belongs
+            # to the sandbox balance even while the trade remains open.
             balance += float(trade.realized_pnl_usd or 0.0)
 
         return max(balance, 0.0)

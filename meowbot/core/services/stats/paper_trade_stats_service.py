@@ -67,7 +67,10 @@ class PaperTradeStatsService:
         wins = [t for t in closed_trades if float(t.realized_pnl_usd or 0.0) > 0]
         losses = [t for t in closed_trades if float(t.realized_pnl_usd or 0.0) <= 0]
 
-        net_profit_usd = sum(float(t.realized_pnl_usd or 0.0) for t in closed_trades)
+        # Open trades can already have realized PnL after TP1/TP2. That money is
+        # available for the sandbox deposit even before the final close.
+        net_profit_usd = sum(float(t.realized_pnl_usd or 0.0) for t in trades)
+        closed_net_profit_usd = sum(float(t.realized_pnl_usd or 0.0) for t in closed_trades)
         gross_profit_usd = sum(float(t.realized_pnl_usd or 0.0) for t in wins)
         gross_loss_usd = sum(float(t.realized_pnl_usd or 0.0) for t in losses)
 
@@ -82,7 +85,7 @@ class PaperTradeStatsService:
             else 0.0
         )
 
-        avg_trade_usd = net_profit_usd / closed_count if closed_count else 0.0
+        avg_trade_usd = closed_net_profit_usd / closed_count if closed_count else 0.0
         avg_win_usd = gross_profit_usd / wins_count if wins_count else 0.0
         avg_loss_usd = gross_loss_usd / losses_count if losses_count else 0.0
 

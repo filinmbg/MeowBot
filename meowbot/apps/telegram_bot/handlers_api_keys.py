@@ -3,6 +3,8 @@ from __future__ import annotations
 from aiogram import Router
 from aiogram.types import Message
 
+from meowbot.apps.telegram_bot.menu_support import normalize_json_mapping
+
 
 def register_api_keys_handlers(
     *,
@@ -71,7 +73,7 @@ def register_api_keys_handlers(
             await message.answer("🔒 Активного Binance API ключа не знайдено.")
             return
 
-        permissions = key_row.get("permissions_json") or {}
+        permissions = normalize_json_mapping(key_row.get("permissions_json"))
         enable_reading = bool(permissions.get("enableReading", False))
         enable_futures = bool(permissions.get("enableFutures", False))
         enable_withdrawals = bool(permissions.get("enableWithdrawals", False))

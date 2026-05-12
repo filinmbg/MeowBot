@@ -89,9 +89,11 @@ class BinanceApiKeyValidationService:
                 )
 
             if self.require_withdrawals_disabled and enable_withdrawals:
+                permissions = dict(permissions)
+                permissions["policy_warning"] = "enableWithdrawals_enabled"
                 return ApiKeyValidationResult(
-                    ok=False,
-                    reason="enableWithdrawals_must_be_false",
+                    ok=True,
+                    reason="enableWithdrawals_warning",
                     permissions_json=permissions,
                     api_key_fingerprint=self._fingerprint_api_key(api_key),
                     exchange_account_fingerprint=self._fingerprint_account(account),

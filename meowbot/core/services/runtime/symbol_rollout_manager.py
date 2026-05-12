@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import time
+import logging
+
+from meowbot.core.services.runtime.symbol_validator import filter_valid_binance_usdt_symbols
+
+
+log = logging.getLogger("meowbot")
 
 
 class SymbolRolloutManager:
@@ -13,7 +19,13 @@ class SymbolRolloutManager:
         max_count: int | None = None,
         grow_interval_seconds: int = 900,
     ) -> None:
-        cleaned = [s.strip().upper() for s in all_symbols if s and s.strip()]
+        cleaned, invalid = filter_valid_binance_usdt_symbols(all_symbols)
+        if invalid:
+            log.warning(
+                "[rollout] invalid symbols skipped count=%s examples=%s",
+                len(invalid),
+                [f"{item.normalized_symbol or item.symbol}:{item.reason}" for item in invalid[:10]],
+            )
         self.all_symbols = cleaned
         self.base_count = max(1, base_count)
         self.step = max(1, step)

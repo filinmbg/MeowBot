@@ -29,6 +29,16 @@ class RelativeVolumeConfig(BaseModel):
     periods: tuple[int, ...] = (20, 50, 100)
 
 
+class AdxConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    periods: tuple[int, ...] = (14,)
+
+
+class VolumePeakConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    periods: tuple[int, ...] = (10,)
+
+
 class MacdConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
     fast: int = 12
@@ -56,6 +66,8 @@ class IndicatorSetConfig(BaseModel):
     rsi: RsiConfig = Field(default_factory=RsiConfig)
     atr: AtrConfig = Field(default_factory=AtrConfig)
     relative_volume: RelativeVolumeConfig = Field(default_factory=RelativeVolumeConfig)
+    adx: AdxConfig = Field(default_factory=AdxConfig)
+    volume_peak: VolumePeakConfig = Field(default_factory=VolumePeakConfig)
     macd: MacdConfig = Field(default_factory=MacdConfig)
     supertrend: tuple[SupertrendVariantConfig, ...] = (
         SupertrendVariantConfig(period=10, multiplier=3.0),
@@ -68,6 +80,8 @@ class IndicatorSetConfig(BaseModel):
             *self.rsi.periods,
             *self.atr.periods,
             *self.relative_volume.periods,
+            *self.adx.periods,
+            *self.volume_peak.periods,
             self.macd.slow + self.macd.signal,
             *(variant.period for variant in self.supertrend),
         ]
@@ -97,10 +111,31 @@ class IndicatorSetConfig(BaseModel):
         )
 
         for period in self.relative_volume.periods:
+            names.append(f"volume_sma{period}")
             names.append(f"relative_volume{period}")
 
         for variant in self.supertrend:
             names.append(variant.bullish_feature_name)
+
+        # Runtime aliases required by V2 strategy rules. Keep the legacy names
+        # above for backward compatibility, but persist exact V2 field names too.
+        names.extend(
+            [
+                "rsi_14",
+                "ema_50",
+                "dist_to_ema_50_pct",
+                "atr_14_pct",
+                "volume_sma_20",
+                "volume_ratio_sma_20",
+                "close_position_in_candle",
+            ]
+        )
+
+        for period in self.adx.periods:
+            names.append(f"adx_{period}")
+
+        for period in self.volume_peak.periods:
+            names.append(f"vol_peak_offset_{period}")
 
         return tuple(names)
 
